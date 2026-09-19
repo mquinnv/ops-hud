@@ -174,9 +174,16 @@ interface AppInternals {
   }): CiProvider[]
 }
 
-function makeApp(providers: CiProvider[]) {
+// History on launch (showCompletedFor) is off unless a test asks for it, so
+// each test states the visibility window it depends on.
+function makeApp(
+  providers: CiProvider[],
+  opts: { now?: () => number; historyMinutes?: number } = {},
+) {
   const { dashboard, rendered, logs, handlers } = makeDashboard()
-  const app = new App({ providers, dashboard })
+  const configManager = new ConfigManager()
+  configManager.updateFromArgs({ showCompletedFor: opts.historyMinutes ?? 0 })
+  const app = new App({ providers, dashboard, configManager, now: opts.now })
   const internals = app as unknown as AppInternals
   internals.repositories = ["acme/widgets"]
   return { app, internals, rendered, logs, handlers }
@@ -230,14 +237,75 @@ describe("performRefresh visibility", () => {
     expect(internals.completedWorkflows.has(run.key)).toBe(false)
   })
 
-  test("a finished run nobody watched stays off the grid", async () => {
+  test("a finished run from before ops-hud started stays off the grid", async () => {
     const run = makeRun({ status: "passed" })
-    const { internals, rendered } = makeApp([new FakeProvider("github", [run])])
+    const { internals, rendered } = makeApp([new FakeProvider("github", [run])], {
+      now: () => Date.parse("2026-09-17T11:00:00Z"),
+    })
 
     await internals.performRefresh()
 
     expect(visibleKeys(rendered)).toEqual([])
     expect(internals.watchedWorkflows.has(run.key)).toBe(false)
+  })
+
+  // showCompletedFor: on launch, show what finished in the last N minutes
+  // rather than an empty grid. The window is fixed at launch, not rolling, so
+  // history cards stay until dismissed like any other finished run.
+  describe("recent history on launch", () => {
+    const start = () => Date.parse("2026-09-17T10:00:00Z")
+    const finished = (createdAt: string, finishedAt?: string, id = "1") =>
+      makeRun({ status: "passed", createdAt, finishedAt, id })
+
+    test("a run that finished inside the window before launch is shown", async () => {
+      const run = finished("2026-09-17T09:10:00Z", "2026-09-17T09:20:00Z")
+      const { internals, rendered } = makeApp([new FakeProvider("github", [run])], {
+        now: start,
+        historyMinutes: 60,
+      })
+
+      await internals.performRefresh()
+
+      expect(visibleKeys(rendered)).toEqual([run.key])
+    })
+
+    test("one that finished before the window is not", async () => {
+      const run = finished("2026-09-17T08:40:00Z", "2026-09-17T08:50:00Z")
+      const { internals, rendered } = makeApp([new FakeProvider("github", [run])], {
+        now: start,
+        historyMinutes: 60,
+      })
+
+      await internals.performRefresh()
+
+      expect(visibleKeys(rendered)).toEqual([])
+    })
+
+    // A long run created before the window but finishing inside it happened
+    // recently in every sense that matters: judge by when it finished.
+    test("finishing time wins over creation time", async () => {
+      const run = finished("2026-09-17T08:00:00Z", "2026-09-17T09:30:00Z")
+      const { internals, rendered } = makeApp([new FakeProvider("github", [run])], {
+        now: start,
+        historyMinutes: 60,
+      })
+
+      await internals.performRefresh()
+
+      expect(visibleKeys(rendered)).toEqual([run.key])
+    })
+
+    test("a window of 0 turns history off", async () => {
+      const run = finished("2026-09-17T09:40:00Z", "2026-09-17T09:50:00Z")
+      const { internals, rendered } = makeApp([new FakeProvider("github", [run])], {
+        now: start,
+        historyMinutes: 0,
+      })
+
+      await internals.performRefresh()
+
+      expect(visibleKeys(rendered)).toEqual([])
+    })
   })
 
   test("a run that finishes while watched stays up until it is dismissed", async () => {
@@ -268,6 +336,94 @@ describe("performRefresh visibility", () => {
 })
 
 describe("dismissal", () => {
+  // Buildkite is fetched at most every 15s, so a fast build can start and
+  // finish between two fetches and never be seen in flight. Whether a run
+  // happened while ops-hud was watching is judged by when it was created, not
+  // by whether a fetch happened to catch it running.
+  describe("runs that happen while ops-hud is watching", () => {
+    const start = () => Date.parse("2026-09-17T10:00:00Z")
+    const finishedAt = (createdAt: string) => makeRun({ status: "passed", createdAt })
+
+    test("a run that started and finished between two refreshes is still shown", async () => {
+      const run = finishedAt("2026-09-17T10:05:00Z")
+      const { internals, rendered } = makeApp([new FakeProvider("buildkite", [run])], {
+        now: start,
+      })
+
+      await internals.performRefresh()
+
+      expect(visibleKeys(rendered)).toEqual([run.key])
+      expect(internals.completedWorkflows.has(run.key)).toBe(true)
+    })
+
+    test("a run created just before startup still counts, to absorb clock skew", async () => {
+      const run = finishedAt("2026-09-17T09:59:40Z")
+      const { internals, rendered } = makeApp([new FakeProvider("buildkite", [run])], {
+        now: start,
+      })
+
+      await internals.performRefresh()
+
+      expect(visibleKeys(rendered)).toEqual([run.key])
+    })
+
+    test("a run created well before startup does not", async () => {
+      const run = finishedAt("2026-09-17T09:59:00Z")
+      const { internals, rendered } = makeApp([new FakeProvider("buildkite", [run])], {
+        now: start,
+      })
+
+      await internals.performRefresh()
+
+      expect(visibleKeys(rendered)).toEqual([])
+    })
+
+    test("dismissing one keeps it dismissed across refreshes", async () => {
+      const run = finishedAt("2026-09-17T10:05:00Z")
+      const { internals, rendered } = makeApp([new FakeProvider("buildkite", [run])], {
+        now: start,
+      })
+
+      await internals.performRefresh()
+      internals.dismissRun(run.key)
+      await internals.performRefresh()
+
+      expect(visibleKeys(rendered)).toEqual([])
+    })
+
+    test("dismiss-all keeps them dismissed across refreshes", async () => {
+      const a = finishedAt("2026-09-17T10:05:00Z")
+      const b = makeRun({ status: "passed", createdAt: "2026-09-17T10:06:00Z", id: "b" })
+      const { internals, rendered } = makeApp([new FakeProvider("buildkite", [a, b])], {
+        now: start,
+      })
+
+      await internals.performRefresh()
+      internals.dismissAllCompletedRuns([a, b])
+      await internals.performRefresh()
+
+      expect(visibleKeys(rendered)).toEqual([])
+    })
+
+    // A GitHub rerun keeps the run's id, so its key is unchanged. Dismissing
+    // the first attempt must not hide the second one when it finishes.
+    test("a dismissed run that is re-run comes back and stays up when it finishes", async () => {
+      const run = finishedAt("2026-09-17T10:05:00Z")
+      const provider = new FakeProvider("github", [run])
+      const { internals, rendered } = makeApp([provider], { now: start })
+
+      await internals.performRefresh()
+      internals.dismissRun(run.key)
+      provider.setRuns([{ ...run, status: "running" }])
+      await internals.performRefresh()
+      expect(visibleKeys(rendered)).toEqual([run.key])
+
+      provider.setRuns([{ ...run, status: "failed" }])
+      await internals.performRefresh()
+      expect(visibleKeys(rendered)).toEqual([run.key])
+    })
+  })
+
   test("dismissing a run drops it from both trackers and from the grid", async () => {
     const running = makeRun({ status: "running" })
     const provider = new FakeProvider("github", [running])

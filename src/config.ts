@@ -71,7 +71,7 @@ const DEFAULT_CONFIG: Config = {
   organizations: [], // Don't default to any orgs
   refreshInterval: 5000, // 5 seconds
   maxWorkflows: 20,
-  showCompletedFor: 60, // minutes - show completed for longer
+  showCompletedFor: 60, // minutes of recent history shown on launch; 0 = none
   buildkite: {},
 }
 
@@ -148,8 +148,11 @@ export class ConfigManager {
     return this.config.maxWorkflows || 20
   }
 
+  // Minutes of recent history to show on launch. 0 turns it off, so this must
+  // not fall back with `||`, which would turn a deliberate 0 into the default.
   get showCompletedFor(): number {
-    return this.config.showCompletedFor || 5
+    const minutes = this.config.showCompletedFor
+    return typeof minutes === "number" && minutes >= 0 ? minutes : 60
   }
 
   get buildkite(): BuildkiteConfig {

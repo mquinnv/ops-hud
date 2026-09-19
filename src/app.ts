@@ -17,6 +17,11 @@ import type { DockerServiceStatus, Job, PullRequest, Run } from "./types.js"
 
 const execAsync = promisify(exec)
 
+// A run created up to this long before ops-hud started still counts as having
+// happened while it was watching: provider timestamps and the local clock can
+// disagree by a few seconds.
+const CLOCK_SKEW_GRACE_MS = 30_000
+
 /** Substitutions for the tests; production constructs every one of these. */
 export interface AppDependencies {
   github?: GitHubProvider
@@ -29,6 +34,8 @@ export interface AppDependencies {
    * without touching the network. Production builds a real BuildkiteProvider.
    */
   buildkiteFactory?: (options: BuildkiteProviderOptions) => CiProvider
+  /** Clock, for deciding which runs happened while ops-hud was watching. */
+  now?: () => number
 }
 
 export class App {
@@ -53,6 +60,14 @@ export class App {
   private isRefreshing = false
   private watchedWorkflows: Set<string> = new Set() // Run keys we've been watching
   private completedWorkflows: Map<string, Run> = new Map() // Keep finished runs until dismissed
+  // When ops-hud started watching. A run that finished after this happened
+  // while the user was watching, even if it started and finished between two
+  // fetches and so was never seen in flight — Buildkite is only fetched every
+  // 15s. See finishedInWindow().
+  private readonly watchingSince: number
+  // Finished runs the user dismissed. A run created after watchingSince would
+  // otherwise be re-added on the next refresh.
+  private dismissedRuns: Set<string> = new Set()
   // Blocked runs the user dismissed, with the status they had at the time.
   // Hidden only while that status holds: once unblocked, canceled or
   // anything else, the run comes back.
@@ -83,6 +98,7 @@ export class App {
     // Constructing a Dashboard takes the terminal, so a caller that supplies
     // one (the tests) must be able to keep that from happening.
     this.dashboard = deps.dashboard ?? new Dashboard()
+    this.watchingSince = (deps.now ?? Date.now)()
   }
 
   async initialize(args: {
@@ -573,7 +589,14 @@ export class App {
       for (const run of allRuns) {
         if (isActive(run.status)) {
           this.watchedWorkflows.add(run.key)
-        } else if (this.watchedWorkflows.has(run.key) && !this.completedWorkflows.has(run.key)) {
+          // Running again (a GitHub rerun keeps its key): an earlier
+          // dismissal no longer applies.
+          this.dismissedRuns.delete(run.key)
+        } else if (
+          !this.completedWorkflows.has(run.key) &&
+          !this.dismissedRuns.has(run.key) &&
+          (this.watchedWorkflows.has(run.key) || this.finishedInWindow(run))
+        ) {
           // Reached a verdict while being watched
           this.completedWorkflows.set(run.key, run)
         }
@@ -681,6 +704,19 @@ export class App {
     }
   }
 
+  /**
+   * Finished while ops-hud was watching, or in the recent-history window
+   * (showCompletedFor minutes) before it started. The window is fixed at
+   * launch, not rolling. Judged by when the run finished, falling back to when
+   * it was created, and never narrower than the clock-skew grace.
+   */
+  private finishedInWindow(run: Run): boolean {
+    const at = Date.parse(run.finishedAt ?? run.createdAt)
+    const historyMs = this.configManager.showCompletedFor * 60_000
+    const windowStart = this.watchingSince - Math.max(CLOCK_SKEW_GRACE_MS, historyMs)
+    return !Number.isNaN(at) && at >= windowStart
+  }
+
   /** Active and not a dismissed blocked run, or finished and still awaiting dismissal. */
   private isVisible(run: Run): boolean {
     if (this.dismissedBlocked.get(run.key) === run.status) return false
@@ -697,6 +733,7 @@ export class App {
     }
     this.completedWorkflows.delete(key)
     this.watchedWorkflows.delete(key)
+    this.dismissedRuns.add(key)
     // Update display immediately without API refresh
     this.updateDisplayAfterDismiss()
   }
@@ -706,6 +743,7 @@ export class App {
     runs.forEach((run) => {
       this.completedWorkflows.delete(run.key)
       this.watchedWorkflows.delete(run.key)
+      this.dismissedRuns.add(run.key)
     })
     // Update display immediately without API refresh
     this.updateDisplayAfterDismiss()

@@ -172,3 +172,31 @@ describe("loaded config path", () => {
     expect(manager.loadedPath).toBe(join(base, ".gh-hud.json"))
   })
 })
+
+describe("showCompletedFor", () => {
+  const withSetting = (value: unknown) => {
+    const manager = new ConfigManager()
+    manager.updateFromArgs({ showCompletedFor: value as number })
+    return manager.showCompletedFor
+  }
+
+  // 0 means "no history on launch". A `||` fallback would silently turn it
+  // back into the default.
+  test("keeps a deliberate 0", () => {
+    expect(withSetting(0)).toBe(0)
+  })
+
+  test("defaults to 60 minutes", () => {
+    expect(new ConfigManager().showCompletedFor).toBe(60)
+    expect(withSetting(undefined)).toBe(60)
+  })
+
+  test("ignores a negative or non-numeric value", () => {
+    expect(withSetting(-5)).toBe(60)
+    expect(withSetting("30")).toBe(60)
+  })
+
+  test("keeps any other number", () => {
+    expect(withSetting(15)).toBe(15)
+  })
+})
