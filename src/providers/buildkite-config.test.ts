@@ -139,6 +139,34 @@ describe("BuildkiteProvider with a failing token", () => {
     expect(result.diagnostics[0].message).toContain("rejected")
   })
 
+  // Found live: a token with read_builds and read_pipelines, but no
+  // read_organizations, got a 403 from org auto-detection — and the message
+  // told the user to add the two scopes they already had.
+  test("a rejected org lookup names read_organizations, and the way around it", async () => {
+    const provider = new BuildkiteProvider({
+      token: "no-org-scope",
+      fetch: async (url: string) =>
+        url.endsWith("/organizations")
+          ? new Response("", { status: 403 })
+          : new Response("[]", { status: 200 }),
+    })
+    const result = await provider.fetchRuns(emptyScope)
+    expect(result.diagnostics[0].level).toBe("error")
+    expect(result.diagnostics[0].message).toContain("read_organizations")
+    expect(result.diagnostics[0].message).toContain("buildkite.org")
+    expect(result.diagnostics[0].message).not.toContain("read_builds")
+  })
+
+  test("a rejected builds read still names the read scopes", async () => {
+    const provider = new BuildkiteProvider({
+      token: "bad",
+      org: "acme",
+      fetch: async () => new Response("", { status: 403 }),
+    })
+    const result = await provider.fetchRuns(emptyScope)
+    expect(result.diagnostics[0].message).toContain("read_builds, read_pipelines")
+  })
+
   test("reports an ambiguous organization", async () => {
     const provider = new BuildkiteProvider({
       token: "good",

@@ -3,7 +3,7 @@
   "organizations": ["mquinnv", "phenixcrm", "inetalliance", "ameriglide"],
   "refreshInterval": 5000,
   "maxWorkflows": 20,
-  "showCompletedFor": 5,
+  "showCompletedFor": 60,
   "buildkite": {
     "org": "my-buildkite-org",
     "pipelines": []

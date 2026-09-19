@@ -204,10 +204,10 @@ describe("indexPipelinesByRepo", () => {
 
   // Several pipelines can build the same repository; none may be lost. The
   // fixture itself exercises this: one pipeline points at
-  // inetalliance/beejax-platform over SSH, another over HTTPS.
+  // ameriglide/beejax-platform over SSH, another over HTTPS.
   test("collects every pipeline for a repository, including a mix of SSH and HTTPS remotes", () => {
     const index = indexPipelinesByRepo(pipelinesFixture as never)
-    expect(index.get("inetalliance/beejax-platform")).toEqual([
+    expect(index.get("ameriglide/beejax-platform")).toEqual([
       "beejax-platform-credential-check",
       "beejax-platform-media-webp-reconcile",
     ])

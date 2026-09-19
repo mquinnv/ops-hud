@@ -74,7 +74,7 @@
       "web_url": "https://buildkite.com/ameriglide/beejax",
       "name": "beejax",
       "slug": "beejax",
-      "repository": "git@github.com:inetalliance/beejax.git",
+      "repository": "git@github.com:ameriglide/beejax.git",
       "default_branch": "main"
     }
   },
@@ -207,7 +207,7 @@
       "web_url": "https://buildkite.com/ameriglide/beejax-platform-credential-check",
       "name": "beejax-platform-credential-check",
       "slug": "beejax-platform-credential-check",
-      "repository": "git@github.com:inetalliance/beejax-platform.git",
+      "repository": "git@github.com:ameriglide/beejax-platform.git",
       "default_branch": "main"
     }
   }

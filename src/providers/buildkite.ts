@@ -82,12 +82,14 @@ export function nextLink(header: string | null): string | undefined {
 }
 
 /** Which token scope a request needs, so a 401/403 can name the missing one. */
-type TokenScope = "read" | "write" | "logs"
+type TokenScope = "read" | "write" | "logs" | "orgs"
 
 const SCOPES_NEEDED: Record<TokenScope, string> = {
   read: "read_builds, read_pipelines",
   write: "write_builds",
   logs: "read_build_logs",
+  // Only org auto-detection lists organizations; naming the org skips it.
+  orgs: "read_organizations, or set buildkite.org to skip auto-detection",
 }
 
 /** A token that is present but rejected by the API (401/403) — must be loud. */
@@ -386,7 +388,7 @@ export class BuildkiteProvider implements CiProvider {
     }
 
     // Not cached on failure: a bad lookup must retry on the next refresh.
-    const orgs = await this.getAll<{ slug: string }>("/organizations")
+    const orgs = await this.getAll<{ slug: string }>("/organizations", "orgs")
     if (orgs.length === 1) {
       this.resolvedOrg = orgs[0].slug
       return this.resolvedOrg
@@ -414,11 +416,11 @@ export class BuildkiteProvider implements CiProvider {
    * response. Only for `/organizations` and the pipeline index — builds use
    * `getPage`, exactly once, regardless of any Link header they carry.
    */
-  private async getAll<T>(path: string): Promise<T[]> {
+  private async getAll<T>(path: string, tokenScope: TokenScope = "read"): Promise<T[]> {
     const out: T[] = []
     let url: string | undefined = path.startsWith("http") ? path : `${API}${path}`
     while (url) {
-      const response = await this.request(url)
+      const response = await this.request(url, undefined, tokenScope)
       out.push(...((await response.json()) as T[]))
       url = nextLink(response.headers.get("link"))
     }

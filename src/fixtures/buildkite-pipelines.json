@@ -38,7 +38,7 @@
     "web_url": "https://buildkite.com/ameriglide/beejax-platform-credential-check",
     "name": "beejax-platform-credential-check",
     "slug": "beejax-platform-credential-check",
-    "repository": "git@github.com:inetalliance/beejax-platform.git",
+    "repository": "git@github.com:ameriglide/beejax-platform.git",
     "default_branch": "main",
     "visibility": "private",
     "created_at": "2026-09-16T23:29:02.607Z"
@@ -49,7 +49,7 @@
     "web_url": "https://buildkite.com/ameriglide/beejax-platform-media-webp-reconcile",
     "name": "beejax-platform-media-webp-reconcile",
     "slug": "beejax-platform-media-webp-reconcile",
-    "repository": "https://github.com/inetalliance/beejax-platform",
+    "repository": "https://github.com/ameriglide/beejax-platform",
     "default_branch": "main",
     "visibility": "private",
     "created_at": "2026-09-16T23:26:30.741Z"

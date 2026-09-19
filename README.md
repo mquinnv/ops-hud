@@ -160,9 +160,10 @@ ops-hud --pipeline backend frontend      # Watch specific pipeline slugs
 ## Buildkite setup
 
 Buildkite support needs an API access token with, at minimum, the
-`read_builds` and `read_pipelines` scopes. Add `write_builds` if you want to
-cancel or rebuild from the dashboard, and `read_build_logs` if you want to
-view logs. (The cancel/rebuild requests are implemented against Buildkite's
+`read_builds` and `read_pipelines` scopes, plus `read_organizations` unless
+you name your organization (see below — auto-detecting it lists your
+organizations). Add `write_builds` if you want to cancel or rebuild from the
+dashboard, and `read_build_logs` if you want to view logs. (The cancel/rebuild requests are implemented against Buildkite's
 documented REST reference, but have not yet been exercised against a live
 token — if one 405s, that's a code bug, not a config problem.)
 
@@ -180,7 +181,8 @@ for a value you're comfortable having sit unencrypted in `~/.ops-hud.json`.
 ### Organization
 
 If your token reaches exactly one Buildkite organization, ops-hud detects it
-automatically. If it reaches more than one, name it explicitly:
+automatically — this needs the `read_organizations` scope. If the token lacks
+that scope, or reaches more than one organization, name it explicitly:
 
 ```json
 {
@@ -218,6 +220,20 @@ or with `--pipeline my-pipeline my-other-pipeline`. With no repositories
 scoped and no explicit pipeline list, ops-hud watches builds across the whole
 organization.
 
+## What shows on the grid
+
+- **Runs in flight**: queued, running or blocked.
+- **Runs that finish while ops-hud is open**, including fast ones that start
+  and finish between two refreshes. (Buildkite is fetched at most every 15s to
+  stay inside its API rate limit, so a quick build may appear after it has
+  already finished.)
+- **Recent history**: runs that finished in the `showCompletedFor` minutes
+  before you launched ops-hud (default 60; set it to `0` for an empty grid on
+  launch).
+
+Finished runs stay until you dismiss them (`d`, or `D` for all). Anything
+older can be brought back with `U`.
+
 ## Configuration
 
 Create a `.ops-hud.json` file in your home directory or project root (see
@@ -235,7 +251,7 @@ Create a `.ops-hud.json` file in your home directory or project root (see
   ],
   "refreshInterval": 5000,
   "maxWorkflows": 20,
-  "showCompletedFor": 5,
+  "showCompletedFor": 60,
   "buildkite": {
     "org": "my-buildkite-org",
     "pipelines": []
@@ -258,7 +274,7 @@ key was never used and is now ignored.
 | `organizations` | string[] | [] | Organizations to monitor |
 | `refreshInterval` | number | 5000 | Refresh interval in milliseconds |
 | `maxWorkflows` | number | 20 | Maximum number of runs to display |
-| `showCompletedFor` | number | 5 | Minutes to show completed runs |
+| `showCompletedFor` | number | 60 | Minutes of recent history shown on launch; `0` for none |
 | `buildkite.token` | string | — | Buildkite API token; `$BUILDKITE_API_TOKEN` takes precedence |
 | `buildkite.org` | string | auto-detected | Buildkite organization slug |
 | `buildkite.pipelines` | string[] | derived from `repositories` | Explicit Buildkite pipeline slugs to watch |
