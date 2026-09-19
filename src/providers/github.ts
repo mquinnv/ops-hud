@@ -23,6 +23,38 @@ const runWithExeca: CommandRunner = async (file, args, options) => {
   return { stdout }
 }
 
+// Every read: runs, jobs, older runs, pull requests, the repo listing. The runs
+// call is usually under a second, but it is a ~270KB page, and a 10s ceiling
+// turned "slow" into "could not list runs".
+const READ_TIMEOUT_MS = 30_000
+
+/** The fields execa adds to the errors it throws, all optional. */
+interface CommandError {
+  timedOut?: boolean
+  stderr?: string
+  code?: string
+  shortMessage?: string
+}
+
+const firstLine = (text: string): string =>
+  text
+    .split("\n")
+    .map((line) => line.trim())
+    .find(Boolean)
+    ?.slice(0, 120) ?? ""
+
+/** Why a `gh` call failed, in a few words — the part "could not list runs" left out. */
+function describeFailure(error: unknown): string {
+  if (error instanceof SyntaxError) return "unreadable response"
+  const e = (error ?? {}) as CommandError & { message?: string }
+  if (e.timedOut) {
+    const ms = /after (\d+) milliseconds/.exec(e.shortMessage ?? e.message ?? "")?.[1]
+    return ms ? `timed out after ${Number(ms) / 1000}s` : "timed out"
+  }
+  if (e.code === "ENOENT") return "gh is not installed or not on PATH"
+  return firstLine(e.stderr ?? "") || firstLine(e.shortMessage ?? e.message ?? String(error))
+}
+
 export class GitHubProvider implements CiProvider {
   readonly name = "github"
 
@@ -39,7 +71,7 @@ export class GitHubProvider implements CiProvider {
         args.push(org)
       }
 
-      const { stdout } = await this.run("gh", args, { timeout: 10000 })
+      const { stdout } = await this.run("gh", args, { timeout: READ_TIMEOUT_MS })
       const repos = JSON.parse(stdout)
 
       return repos.map((repo: { owner: { login: string }; name: string }) => ({
@@ -72,7 +104,7 @@ export class GitHubProvider implements CiProvider {
         const { stdout } = await this.run(
           "gh",
           ["api", `repos/${repo}/actions/runs?per_page=${this.limit}`],
-          { timeout: 10000 },
+          { timeout: READ_TIMEOUT_MS },
         )
         const payload = JSON.parse(stdout) as { workflow_runs: GitHubRunPayload[] }
         const mapped = (payload.workflow_runs ?? []).map(mapGitHubRun)
@@ -99,7 +131,7 @@ export class GitHubProvider implements CiProvider {
         "gh",
         ["api", `repos/${repo}/actions/runs/${run.id}/jobs`],
         {
-          timeout: 10000,
+          timeout: READ_TIMEOUT_MS,
         },
       )
 
@@ -150,7 +182,7 @@ export class GitHubProvider implements CiProvider {
         const { stdout } = await this.run(
           "gh",
           ["api", `repos/${repo}/actions/runs?per_page=${limit}&created=${created}`],
-          { timeout: 10000 },
+          { timeout: READ_TIMEOUT_MS },
         )
         const payload = JSON.parse(stdout) as { workflow_runs: GitHubRunPayload[] }
         runs.push(...(payload.workflow_runs ?? []).map(mapGitHubRun))
@@ -164,15 +196,20 @@ export class GitHubProvider implements CiProvider {
     return { runs: runs.slice(0, limit), diagnostics }
   }
 
-  /** A rate limit is worth naming; anything else is reported against the repo. */
+  /**
+   * A rate limit is worth naming on its own — GitHub words its primary and
+   * secondary limits differently. Anything else is reported against the repo,
+   * with the cause.
+   */
   private diagnose(error: unknown, fallback: string): ProviderDiagnostic {
-    const message = error instanceof Error ? error.message : String(error)
+    const e = (error ?? {}) as CommandError & { message?: string }
+    const text = `${e.message ?? String(error)}\n${e.stderr ?? ""}`
     return {
       provider: "github",
       level: "error",
-      message: message.includes("API rate limit exceeded")
+      message: /rate limit/i.test(text)
         ? "GitHub: API rate limit exceeded"
-        : fallback,
+        : `${fallback} — ${describeFailure(error)}`,
     }
   }
 
@@ -220,7 +257,7 @@ export class GitHubProvider implements CiProvider {
           "--json",
           "id,number,title,state,isDraft,headRefName,baseRefName,url,createdAt,updatedAt,author,statusCheckRollup,reviewDecision,mergeable",
         ],
-        { timeout: 10000 },
+        { timeout: READ_TIMEOUT_MS },
       )
 
       const prs = JSON.parse(stdout)

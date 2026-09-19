@@ -24,6 +24,18 @@ function failingRunner(message: string): CommandRunner {
   }
 }
 
+/** A runner that fails the way execa does, with its extra fields. */
+function execaFailure(fields: {
+  timedOut?: boolean
+  stderr?: string
+  code?: string
+  shortMessage?: string
+}): CommandRunner {
+  return async () => {
+    throw Object.assign(new Error(fields.shortMessage ?? "Command failed"), fields)
+  }
+}
+
 describe("GitHubProvider.fetchRuns", () => {
   test("maps the payload the API returns", async () => {
     const { runner } = recordingRunner(JSON.stringify(runsFixture))
@@ -61,8 +73,63 @@ describe("GitHubProvider.fetchRuns", () => {
     const { diagnostics } = await provider.fetchRuns(scope)
 
     expect(diagnostics).toHaveLength(1)
-    expect(diagnostics[0].message).toBe("GitHub: could not list runs for acme/widgets")
+    expect(diagnostics[0].message).toStartWith("GitHub: could not list runs for acme/widgets")
     expect(diagnostics[0].level).toBe("error")
+  })
+
+  // "could not list runs" alone is undiagnosable: the same call can work by
+  // hand. Say why it failed.
+  describe("names the cause of a failure", () => {
+    const messageFor = async (runner: CommandRunner) =>
+      (await new GitHubProvider(runner).fetchRuns(scope)).diagnostics[0]?.message
+
+    test("a timeout, with its limit", async () => {
+      const runner = execaFailure({
+        timedOut: true,
+        shortMessage: "Command timed out after 30000 milliseconds",
+      })
+      expect(await messageFor(runner)).toBe(
+        "GitHub: could not list runs for acme/widgets — timed out after 30s",
+      )
+    })
+
+    test("gh's own error line", async () => {
+      const runner = execaFailure({
+        stderr: "gh: Server Error (HTTP 502)\n",
+        shortMessage: "Command failed with exit code 1",
+      })
+      expect(await messageFor(runner)).toBe(
+        "GitHub: could not list runs for acme/widgets — gh: Server Error (HTTP 502)",
+      )
+    })
+
+    test("gh missing from PATH", async () => {
+      const runner = execaFailure({ code: "ENOENT", shortMessage: "spawn gh ENOENT" })
+      expect(await messageFor(runner)).toBe(
+        "GitHub: could not list runs for acme/widgets — gh is not installed or not on PATH",
+      )
+    })
+
+    test("a response that is not JSON", async () => {
+      const { runner } = recordingRunner("<html>oops</html>")
+      expect(await messageFor(runner)).toBe(
+        "GitHub: could not list runs for acme/widgets — unreadable response",
+      )
+    })
+
+    // GitHub's abuse limit words it differently from the primary one.
+    test("a secondary rate limit is still a rate limit", async () => {
+      const runner = execaFailure({
+        stderr: "gh: You have exceeded a secondary rate limit (HTTP 403)",
+      })
+      expect(await messageFor(runner)).toBe("GitHub: API rate limit exceeded")
+    })
+  })
+
+  test("gives the runs listing 30s before giving up", async () => {
+    const { runner, calls } = recordingRunner(JSON.stringify(runsFixture))
+    await new GitHubProvider(runner).fetchRuns(scope)
+    expect(calls[0].options?.timeout).toBe(30_000)
   })
 
   test("treats a payload with no workflow_runs as empty, not as an error", async () => {
@@ -136,7 +203,9 @@ describe("GitHubProvider.fetchOlderRuns", () => {
     const provider = new GitHubProvider(failingRunner("exit code 1"))
     const { diagnostics } = await provider.fetchOlderRuns(scope, "2026-09-01T00:00:00Z", 1)
 
-    expect(diagnostics[0].message).toBe("GitHub: could not list older runs for acme/widgets")
+    expect(diagnostics[0].message).toBe(
+      "GitHub: could not list older runs for acme/widgets — exit code 1",
+    )
   })
 })
 
