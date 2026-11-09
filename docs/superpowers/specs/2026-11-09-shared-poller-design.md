@@ -209,10 +209,11 @@ Pane → poller:
   repositories (default: the pane's subscription) at once, ignoring the tick
   but not the budget pause, at most once every 2 seconds per repository.
 - `older { id, repositories, before, limit }` — the `U` key. The poller
-  fetches runs older than `before` (GitHub: the run list with
+  fetches GitHub runs older than `before` (the run list with
   `created=<before`, over `fetch` like every other poller request, so the
-  spend is seen; Buildkite: the provider's existing `fetchOlderRuns`) and
-  replies with `older-result { id, runs, diagnostics }`. Routed through the
+  spend is seen) and replies with `older-result { id, runs, diagnostics }`.
+  Buildkite has never paged backwards and still does not; the resurrect
+  cursor is the oldest GitHub run on screen, as today. Routed through the
   poller so that it is counted against the shared budget and paused with
   everything else.
 
@@ -310,10 +311,14 @@ were the only subscriber: the builds of the pipelines its own `watch`
 selects (its explicit slugs if it named any, else the slugs derived from its
 own repositories), and the diagnostics about those pipelines or
 repositories. Two panes on different checkouts sharing a global token do not
-see each other's builds, which is today's behavior. Filtering is by pipeline
-slug, not by `Run.repo.fullName`, so explicit slugs whose repository is not
-otherwise watched, and pipelines with a non-GitHub remote, keep showing as
-they do now. An instance with no subscribers is dropped.
+see each other's builds, which is today's behavior. A pane that named explicit
+slugs is filtered by `pipelineSlug`; one that derives from its repositories
+is filtered by `Run.repo.fullName`, which is exactly the key the derivation
+used. Explicit slugs whose repository is not otherwise watched, and
+pipelines with a non-GitHub remote, therefore keep showing as they do now.
+Repository-level diagnostics carry a `repository` field and follow the same
+filter; instance-level ones (token, org, rate limit) reach every
+subscriber. An instance with no subscribers is dropped.
 
 Buildkite tokens travel over a `0700`-directory Unix socket between processes
 of the same user. That is the same trust boundary as the config file they
