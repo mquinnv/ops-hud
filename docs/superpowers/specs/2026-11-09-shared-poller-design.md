@@ -1,7 +1,7 @@
 # ops-hud: one poller per machine
 
 Date: 2026-11-09
-Status: approved in conversation, pending builder check
+Status: approved in conversation; builder-check questions folded in
 
 ## Summary
 
@@ -146,6 +146,12 @@ is the package version, so a freshly installed ops-hud never talks to a
 poller running old code: it starts its own, and the old poller exits on its
 own when its last old-version pane closes.
 
+`OPS_HUD_POLLER_SOCKET` overrides the path outright. When ops-hud is running
+from source (`bun dev`, detected by the entry script ending in `.ts`) the
+name gets a `-dev` suffix, so a developer's panes never attach to the
+installed poller serving the rest of the machine, and the installed panes
+never attach to a poller running half-edited code.
+
 Pane startup, in order:
 
 1. Connect to the socket. On success, go to "Session".
@@ -158,6 +164,12 @@ Pane startup, in order:
 4. If still unreachable, log a warning to the event log and run the poller
    in-process (same class, no socket). The pane is fully functional, just not
    shared. This is also the path on platforms without Unix sockets.
+5. An in-process pane is not stuck there. Every 30 seconds it tries step 1
+   again; on success it sends `watch`, discards its in-process poller, and
+   carries on from the shared snapshot. One refetch's worth of requests is
+   the accepted cost of the handover. Ten panes restored at once on a busy
+   machine, several of which fall back while the first poller is still
+   starting, therefore converge on one poller within a minute.
 
 Two panes starting together may both reach step 2. Both spawn a poller; the
 pollers race to `listen()`; the loser gets `EADDRINUSE` and exits
@@ -185,8 +197,10 @@ Pane → poller:
 - `hello { version, pid }` — first message. A poller whose version differs
   closes the connection; the pane then starts its own (this only happens if
   someone edits the socket name by hand).
-- `watch { repositories: string[], interval: number, buildkite?: { token,
-  org?, pipelines? } }` — replaces the pane's subscription. `interval` is the
+- `watch { repositories: string[], interval: number, github: boolean,
+  buildkite?: { token, org?, pipelines? } }` — replaces the pane's
+  subscription. `github: false` is `--no-github`: the repositories are
+  used for Buildkite derivation only and are not polled on GitHub. `interval` is the
   pane's `refreshInterval` in ms; the poller uses the minimum across panes
   for a repository, floored at 5,000. `buildkite` carries whatever the pane
   resolved from env and config, exactly as `BuildkiteProvider` is constructed
@@ -195,9 +209,12 @@ Pane → poller:
   repositories (default: the pane's subscription) at once, ignoring the tick
   but not the budget pause, at most once every 2 seconds per repository.
 - `older { id, repositories, before, limit }` — the `U` key. The poller
-  performs `fetchOlderRuns` and replies with `older-result { id, runs,
-  diagnostics }`. Routed through the poller only so that it is counted
-  against the shared budget and paused with everything else.
+  fetches runs older than `before` (GitHub: the run list with
+  `created=<before`, over `fetch` like every other poller request, so the
+  spend is seen; Buildkite: the provider's existing `fetchOlderRuns`) and
+  replies with `older-result { id, runs, diagnostics }`. Routed through the
+  poller so that it is counted against the shared budget and paused with
+  everything else.
 
 Poller → pane:
 
@@ -223,10 +240,14 @@ One `GitHubPoller` owns the HTTP side. It is injectable with a `fetch` and a
 clock, like `BuildkiteProvider`, so every rule below is unit-testable with no
 network.
 
-**Auth.** Token from `GH_TOKEN`, then `GITHUB_TOKEN`, then one `gh auth
-token` at poller start. On a 401, the token is re-resolved once; if that also
-fails, every pane gets an error diagnostic naming `gh auth status`, and the
-poller exits. The token is sent only to `https://api.github.com`.
+**Auth.** Token from `GH_TOKEN`, then `GITHUB_TOKEN`, then `gh auth token`.
+The GitHub side is an optional component of the poller, never a reason for
+it to exit: a machine with no `gh` login (the Buildkite-only `inetalliance`
+fleet is one) still gets a shared poller for Buildkite. With no token, or
+after a 401, the GitHub side enters an *unauthenticated* state: no GitHub
+requests go out, every subscribed GitHub repository carries an error
+diagnostic naming `gh auth login`, and the token is re-resolved every 60
+seconds until one works. The token is sent only to `https://api.github.com`.
 
 **Requests.** `fetch` with `Authorization: Bearer`, `Accept:
 application/vnd.github+json`, `X-GitHub-Api-Version: 2022-11-28`, and
@@ -274,13 +295,25 @@ only when a 200 arrived for its run list or for any of its job lists.
 
 ### Buildkite in the poller
 
-`BuildkiteProvider` moves into the poller unchanged. The poller holds one
-instance per distinct `(token, org, pipelines)` tuple received in `watch`
-messages and calls `fetchRuns` with the union of the subscribing panes'
-repositories on the same scheduler, honoring the provider's existing
-15-second minimum and 429 backoff. Its diagnostics and the embedded jobs it
-already returns flow into the snapshots of the panes that supplied that
-tuple. An instance with no subscribers is dropped.
+`BuildkiteProvider` moves into the poller. The poller holds one instance per
+distinct `(token, org)` pair received in `watch` messages, so that a
+machine with one Buildkite org makes one set of Buildkite requests no matter
+how many panes or checkouts are open. The instance polls the union of its
+subscribers' scopes: every explicit pipeline slug any of them named, plus
+the slugs derived (through the provider's existing pipeline index) from
+every repository any of them watches. This needs the provider to accept the
+pipeline list per call rather than only at construction; that is the one
+change to it. It keeps its 15-second minimum and 429 backoff.
+
+A pane's snapshot is then filtered back to its own scope, exactly as if it
+were the only subscriber: the builds of the pipelines its own `watch`
+selects (its explicit slugs if it named any, else the slugs derived from its
+own repositories), and the diagnostics about those pipelines or
+repositories. Two panes on different checkouts sharing a global token do not
+see each other's builds, which is today's behavior. Filtering is by pipeline
+slug, not by `Run.repo.fullName`, so explicit slugs whose repository is not
+otherwise watched, and pipelines with a non-GitHub remote, keep showing as
+they do now. An instance with no subscribers is dropped.
 
 Buildkite tokens travel over a `0700`-directory Unix socket between processes
 of the same user. That is the same trust boundary as the config file they
@@ -316,10 +349,12 @@ Concretely:
   again, from step 1) if the socket drops. During reconnect the last
   snapshot stays on screen.
 
-`GitHubProvider` keeps `cancel`, `rerun`, `logs`, `listPullRequests`,
-`listRepositories`, and `fetchOlderRuns` (used by the poller's `older`
-handler). Its `fetchRuns`, `fetchJobs`, and the timed cache are deleted
-along with the `gh api` calls that implemented them.
+`GitHubProvider` keeps `cancel`, `rerun`, `logs`, `listPullRequests`, and
+`listRepositories`: the pane-side, `gh`-backed operations. Its `fetchRuns`,
+`fetchJobs`, `fetchOlderRuns`, and the timed cache are deleted along with
+the `gh api` calls that implemented them; their replacements live in
+`GitHubPoller`. `GitHubProvider` is never constructed in the poller process,
+so the poller spawns `gh` for nothing but the token.
 
 ### Observability
 
@@ -372,6 +407,12 @@ Flagged so they can be reversed cheaply:
 - Idle tick 15s, budget-low threshold 10% or 300, 4× stretch, 60s poller
   linger, 3s startup wait.
 - PR header polls every 30s instead of every tick.
-- Buildkite moves into the poller rather than staying per pane.
+- Buildkite moves into the poller rather than staying per pane, one
+  instance per `(token, org)`, with each pane's view filtered back to its
+  own pipelines.
 - The per-tick spinner is dropped.
 - Windows gets the in-process fallback only.
+- A missing or rejected GitHub token never stops the poller; the GitHub side
+  waits, unauthenticated, and Buildkite carries on.
+- An in-process fallback pane rejoins the shared poller when it can.
+- Dev builds use a `-dev` socket; `OPS_HUD_POLLER_SOCKET` overrides.
