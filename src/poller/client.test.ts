@@ -80,6 +80,8 @@ let servers: PollerServer[]
 let cores: PollerCore[]
 let closers: (() => void)[]
 let raw: Server[]
+/** Connections the raw servers accepted: destroyed first, so `r.close()` never waits on one. */
+let rawSockets: Socket[]
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "ohc-"))
@@ -88,12 +90,23 @@ beforeEach(() => {
   cores = []
   closers = []
   raw = []
+  rawSockets = []
 })
 
 afterEach(async () => {
   for (const close of closers) close()
   for (const s of servers) await s.close()
-  for (const r of raw) await new Promise((resolve) => r.close(resolve))
+  for (const socket of rawSockets) socket.destroy()
+  // A raw server's close waits for its connections to end; on the Linux
+  // release runner that wait outlived the test timeout after a 2 MiB write.
+  // The sockets are already destroyed above, so cap the wait rather than
+  // let a slow teardown fail the test.
+  for (const r of raw) {
+    await Promise.race([
+      new Promise((resolve) => r.close(resolve)),
+      new Promise((resolve) => setTimeout(resolve, 1_000)),
+    ])
+  }
   for (const core of cores) core.stop()
   rmSync(dir, { recursive: true, force: true })
 })
@@ -333,6 +346,7 @@ test("a snapshot line over 1 MiB is delivered intact", async () => {
   const snapshot: Snapshot = { repositories: [REPO], runs: [run], jobs: {}, diagnostics: [] }
   mkdirSync(join(dir, "s"), { recursive: true })
   const server = createServer((socket) => {
+    rawSockets.push(socket)
     socket.on("error", () => {})
     socket.write(encode({ type: "snapshot", snapshot }))
   })
