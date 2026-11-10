@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, unlinkSync } from "node:fs"
+import { existsSync, mkdirSync, statSync, unlinkSync } from "node:fs"
 import { createConnection, createServer, type Server, type Socket } from "node:net"
 import { dirname } from "node:path"
 import type { PollerCore } from "./core.js"
@@ -38,6 +38,9 @@ function answers(path: string): Promise<boolean> {
   })
 }
 
+/** Who holds the socket path now: this server's file, nobody, or a newer poller. */
+type PathOwner = "ours" | "missing" | "other"
+
 interface Connection {
   socket: Socket
   helloed: boolean
@@ -53,6 +56,8 @@ export class PollerServer {
   private readonly onIdle: () => void
   private nextId = 0
   private listening = false
+  /** The socket file this server bound, so a replacement at the same path is told apart. */
+  private identity?: { dev: number; ino: number }
   private started = false
   private lingerTimer?: ReturnType<typeof setTimeout>
   private checkTimer?: ReturnType<typeof setInterval>
@@ -103,6 +108,8 @@ export class PollerServer {
         this.server.off("error", onError)
         this.server.on("error", (error) => this.log(`server error: ${error.message}`))
         this.listening = true
+        const { dev, ino } = statSync(this.opts.socketPath)
+        this.identity = { dev, ino }
         this.checkTimer = setInterval(() => this.checkSocket(), this.socketCheckMs)
         this.checkTimer.unref()
         // A poller nobody ever connects to must not run forever either.
@@ -123,6 +130,7 @@ export class PollerServer {
     this.cancelLinger()
     if (this.checkTimer) clearInterval(this.checkTimer)
     if (this.started) this.core.stop()
+    const sockets = [...this.connections.values()].map((c) => c.socket)
     for (const [clientId, { socket }] of this.connections) {
       this.core.unsubscribe(clientId)
       socket.end()
@@ -131,11 +139,34 @@ export class PollerServer {
     }
     this.connections.clear()
     if (!this.listening) return
+    if (this.pathOwner() === "other") {
+      // A newer poller holds the path. Node's server.close() unlinks a pipe
+      // server's path unconditionally, which would delete the newcomer's file
+      // and leave two pollers running, so the server is never closed here: its
+      // fd is unreachable by path and dies with the process (onIdle exits).
+      // unref() keeps it from holding the event loop open meanwhile.
+      for (const socket of sockets) socket.destroy()
+      this.server.unref()
+      return
+    }
     await new Promise<void>((resolve) => this.server.close(() => resolve()))
+    // Node has usually unlinked the path already; this covers runtimes that do
+    // not, and never touches a file a newer poller bound in the meantime.
+    if (this.pathOwner() !== "ours") return
     try {
       unlinkSync(this.opts.socketPath)
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+    }
+  }
+
+  private pathOwner(): PathOwner {
+    try {
+      const { dev, ino } = statSync(this.opts.socketPath)
+      return dev === this.identity?.dev && ino === this.identity.ino ? "ours" : "other"
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return "missing"
+      throw error
     }
   }
 
@@ -232,8 +263,9 @@ export class PollerServer {
   }
 
   private checkSocket(): void {
-    if (existsSync(this.opts.socketPath)) return
-    this.log("socket file is gone; exiting")
+    const owner = this.pathOwner()
+    if (owner === "ours") return
+    this.log(owner === "missing" ? "socket file is gone; exiting" : "socket file replaced; exiting")
     this.stop()
   }
 

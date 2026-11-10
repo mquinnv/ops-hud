@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test"
-import { existsSync, mkdtempSync, rmSync, unlinkSync } from "node:fs"
-import { createConnection, type Socket } from "node:net"
+import { existsSync, mkdtempSync, renameSync, rmSync, unlinkSync } from "node:fs"
+import { createConnection, createServer, type Server, type Socket } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { FetchResult } from "../providers/types.js"
@@ -68,6 +68,7 @@ let logs: string[]
 let idles: number
 let servers: PollerServer[]
 let clients: Client[]
+let others: Server[]
 
 async function connect(socketPath = path): Promise<Client> {
   const socket = createConnection(socketPath)
@@ -138,11 +139,13 @@ beforeEach(() => {
   idles = 0
   servers = []
   clients = []
+  others = []
 })
 
 afterEach(async () => {
   for (const client of clients) client.socket.destroy()
   for (const s of servers) await s.close()
+  for (const other of others) await new Promise((resolve) => other.close(resolve))
   core.stop()
   rmSync(dir, { recursive: true, force: true })
 })
@@ -282,4 +285,32 @@ test("older is answered with an older-result carrying the same id", async () => 
     runs: [],
     diagnostics: [{ provider: "github", level: "info", message: `${REPO} 2024-01-01T00:00:00Z 5` }],
   })
+})
+
+/** Binds a plain server beside the path, then renames it over the poller's socket file atomically. */
+async function replaceSocketFile(): Promise<void> {
+  const aside = join(dir, "s", "b.sock")
+  const other = createServer((socket) => socket.end())
+  others.push(other)
+  await new Promise<void>((resolve) => other.listen(aside, resolve))
+  renameSync(aside, path)
+}
+
+test("a replaced socket file stops the server without touching the replacement", async () => {
+  await server({ socketCheckMs: 20 }).listen()
+  await replaceSocketFile()
+  await waitFor(() => idles === 1)
+  expect(existsSync(path)).toBe(true)
+  const client = await connect()
+  await client.closed
+})
+
+test("close() leaves a replacement socket file in place", async () => {
+  const s = server()
+  await s.listen()
+  await replaceSocketFile()
+  await s.close()
+  expect(existsSync(path)).toBe(true)
+  const client = await connect()
+  await client.closed
 })

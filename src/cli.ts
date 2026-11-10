@@ -4,7 +4,6 @@ import { dirname, join } from "path"
 import { fileURLToPath } from "url"
 import { App } from "./app.js"
 import { resolveScope } from "./config.js"
-import { runPoller } from "./poller/main.js"
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const packageJson = JSON.parse(readFileSync(join(__dirname, "..", "package.json"), "utf-8"))
@@ -127,7 +126,8 @@ export function buildProgram(): Command {
   program
     .command("__poller", { hidden: true })
     .description("internal: shared poller")
-    .action(() => runPoller())
+    // Loaded lazily so a pane start does not pull in the poller's dependencies.
+    .action(async () => (await import("./poller/main.js")).runPoller())
 
   return program
 }
