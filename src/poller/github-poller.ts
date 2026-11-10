@@ -95,6 +95,11 @@ function diagnostic(repository: string, message: string): ProviderDiagnostic {
   return { provider: "github", level: "error", message, repository }
 }
 
+/** Order-free identity of a diagnostics list, to tell whether a poll changed it. */
+function diagnosticsKey(diagnostics: ProviderDiagnostic[]): string {
+  return JSON.stringify(diagnostics.map((d) => `${d.level}\u0000${d.message}`).sort())
+}
+
 /** GitHub's JSON error bodies carry a `message`; anything else says nothing useful. */
 function messageOf(text: string): string {
   try {
@@ -144,11 +149,19 @@ export class GitHubPoller {
       tracked = { raw: [], runs: [], jobs: new Map(), diagnostics: [] }
       this.repos.set(repo, tracked)
     }
+    const before = diagnosticsKey(tracked.diagnostics)
+    const fresh = await this.refresh(repo, tracked)
+    // A diagnostic appearing or clearing is news too, even when no data arrived.
+    return { changed: fresh || diagnosticsKey(tracked.diagnostics) !== before }
+  }
+
+  /** One poll's requests; true when a 200 arrived. */
+  private async refresh(repo: string, tracked: TrackedRepo): Promise<boolean> {
     // Paused: send nothing, and keep what we had, diagnostic included.
-    if (this.budget.paused) return { changed: false }
+    if (this.budget.paused) return false
     if (!(await this.ensureToken())) {
       tracked.diagnostics = [diagnostic(repo, NOT_LOGGED_IN)]
-      return { changed: false }
+      return false
     }
 
     let changed = false
@@ -166,12 +179,11 @@ export class GitHubPoller {
       changed = true
     } else if (list.kind !== "not-modified") {
       tracked.diagnostics = [this.failure(list, repo, `GitHub: could not list runs for ${repo}`)]
-      return { changed: false }
+      return false
     }
 
-    const current = tracked
     const results = await Promise.all(
-      current.raw.map((raw, i) => this.pollJobs(repo, current, raw, current.runs[i])),
+      tracked.raw.map((raw, i) => this.pollJobs(repo, tracked, raw, tracked.runs[i])),
     )
     const diagnostics: ProviderDiagnostic[] = []
     for (const result of results) {
@@ -180,8 +192,8 @@ export class GitHubPoller {
         diagnostics.push(result)
       }
     }
-    current.diagnostics = diagnostics
-    return { changed }
+    tracked.diagnostics = diagnostics
+    return changed
   }
 
   state(repo: string): RepoState | undefined {

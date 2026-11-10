@@ -250,7 +250,8 @@ describe("budget and errors", () => {
     }))
     const p = new GitHubPoller({ fetch: f.fetch, now: c.now, resolveToken: token() })
     const result = await p.poll(REPO)
-    expect(result.changed).toBe(false)
+    // The diagnostic is new, so this poll changed the repo.
+    expect(result.changed).toBe(true)
     expect(p.budget.paused).toBe(true)
     expect(p.state(REPO)?.diagnostics).toEqual([
       {
@@ -325,6 +326,70 @@ describe("budget and errors", () => {
     expect(f.calls).toHaveLength(11)
     expect(MAX_IN_FLIGHT).toBe(4)
     expect(f.maxInFlight).toBe(MAX_IN_FLIGHT)
+  })
+})
+
+describe("changed", () => {
+  test("a poll that goes from healthy to rate-limited reports changed: true", async () => {
+    const c = clock()
+    let limited = false
+    const f = fakeFetch((_url, nth) =>
+      limited
+        ? {
+            status: 403,
+            headers: rateHeaders(0, c.t / 1000 + 600),
+            body: { message: "API rate limit exceeded" },
+          }
+        : nth === 1
+          ? { status: 200, headers: { etag: '"a"' }, body: runsFixture }
+          : { status: 304, headers: { etag: '"a"' } },
+    )
+    const p = new GitHubPoller({ fetch: f.fetch, now: c.now, resolveToken: token() })
+    await p.poll(REPO)
+    expect(p.state(REPO)?.diagnostics).toEqual([])
+    limited = true
+    expect((await p.poll(REPO)).changed).toBe(true)
+    expect(p.state(REPO)?.diagnostics.map((d) => d.message)).toEqual([
+      "GitHub: API rate limit exceeded",
+    ])
+  })
+
+  test("the next paused poll (same diagnostic, nothing sent) reports changed: false", async () => {
+    const c = clock()
+    const f = fakeFetch(() => ({
+      status: 403,
+      headers: rateHeaders(0, c.t / 1000 + 600),
+      body: { message: "API rate limit exceeded" },
+    }))
+    const p = new GitHubPoller({ fetch: f.fetch, now: c.now, resolveToken: token() })
+    expect((await p.poll(REPO)).changed).toBe(true)
+    c.t += 1_000
+    expect((await p.poll(REPO)).changed).toBe(false)
+    expect(f.calls).toHaveLength(1)
+  })
+
+  test("a 304 after a 200 with no diagnostic change reports changed: false", async () => {
+    const f = fakeFetch((_url, nth) =>
+      nth === 1
+        ? { status: 200, headers: { etag: '"a"' }, body: runsFixture }
+        : { status: 304, headers: { etag: '"a"' } },
+    )
+    const p = new GitHubPoller({ fetch: f.fetch, resolveToken: token() })
+    expect((await p.poll(REPO)).changed).toBe(true)
+    expect((await p.poll(REPO)).changed).toBe(false)
+  })
+
+  test("a diagnostic clearing reports changed: true", async () => {
+    let missing = true
+    const f = fakeFetch(() =>
+      missing ? { status: 404, body: { message: "Not Found" } } : { status: 304 },
+    )
+    const p = new GitHubPoller({ fetch: f.fetch, resolveToken: token() })
+    expect((await p.poll(REPO)).changed).toBe(true)
+    expect((await p.poll(REPO)).changed).toBe(false)
+    missing = false
+    expect((await p.poll(REPO)).changed).toBe(true)
+    expect(p.state(REPO)?.diagnostics).toEqual([])
   })
 })
 
