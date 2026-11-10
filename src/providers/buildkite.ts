@@ -41,6 +41,10 @@ const MIN_FETCH_INTERVAL_MS = 15_000
 /** Backoff after a 429 that names no reset time, in seconds. */
 const DEFAULT_RATE_LIMIT_RESET_S = 60
 
+/** The info diagnostic for Buildkite enabled without a token; the pane adds it too. */
+export const BUILDKITE_NO_TOKEN =
+  "Buildkite: no token ($BUILDKITE_API_TOKEN or buildkite.token) — skipped"
+
 type FetchLike = (url: string, init?: RequestInit) => Promise<Response>
 
 export interface BuildkiteProviderOptions {
@@ -197,7 +201,7 @@ export class BuildkiteProvider implements CiProvider, CiReader {
           {
             provider: "buildkite",
             level: "info",
-            message: "Buildkite: no token ($BUILDKITE_API_TOKEN or buildkite.token) — skipped",
+            message: BUILDKITE_NO_TOKEN,
           },
         ],
       }

@@ -6,6 +6,7 @@ import { DockerServiceManager } from "./docker-utils.js"
 import { createPollerClient, type PollerClient } from "./poller/client.js"
 import type { BuildkiteSubscription, Snapshot } from "./poller/protocol.js"
 import {
+  BUILDKITE_NO_TOKEN,
   BuildkiteProvider,
   type BuildkiteProviderOptions,
   resolveBuildkiteToken,
@@ -119,6 +120,9 @@ export class App {
   private previousDiagnosticMessages: Set<string> = new Set()
   // Set by --no-buildkite, so an empty grid says why there are no builds.
   private buildkiteDisabled = false
+  // Buildkite is on but there is no token, so no Buildkite subscription went
+  // to the poller and it cannot say so: the pane adds the diagnostic itself.
+  private buildkiteNoToken = false
 
   constructor(deps: AppDependencies = {}) {
     this.github = deps.github ?? new GitHubProvider()
@@ -251,6 +255,7 @@ export class App {
   }): CiProvider[] {
     const providers: CiProvider[] = []
     this.buildkiteSubscription = undefined
+    this.buildkiteNoToken = false
     if (!args.noGithub) {
       providers.push(this.github)
     }
@@ -268,6 +273,8 @@ export class App {
           org: options.org,
           pipelines: options.pipelines,
         }
+      } else {
+        this.buildkiteNoToken = true
       }
     }
     return providers
@@ -615,6 +622,9 @@ export class App {
   }
 
   private trackAndRender(snapshot: Snapshot): void {
+    // The only budget a pane joining an established poller gets: the poller
+    // broadcasts budget messages on change only.
+    if (snapshot.budget) this.dashboard.setBudget(snapshot.budget)
     const snapshotJobs = new Map<string, Job[]>(Object.entries(snapshot.jobs))
     const diagnostics = [...snapshot.diagnostics]
     if (this.buildkiteDisabled) {
@@ -622,6 +632,12 @@ export class App {
         provider: "buildkite",
         level: "info",
         message: "Buildkite: disabled (--no-buildkite)",
+      })
+    } else if (this.buildkiteNoToken) {
+      diagnostics.push({
+        provider: "buildkite",
+        level: "info",
+        message: BUILDKITE_NO_TOKEN,
       })
     }
     this.logChangedDiagnostics(diagnostics)

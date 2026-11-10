@@ -1468,6 +1468,55 @@ describe("the shared poller", () => {
     app.stop()
   })
 
+  // A pane joining an established poller gets no budget message (it only goes
+  // out on change); the snapshot's budget is all it has.
+  test("a snapshot's budget reaches the dashboard", async () => {
+    const { app, client, budgets } = makePollerApp()
+    await app.initialize({ repositories: ["acme/widgets"] })
+    const budget: Budget = {
+      provider: "github",
+      limit: 5000,
+      remaining: 3100,
+      resetAt: 1_800_000_000_000,
+      stretched: false,
+    }
+
+    client.emitSnapshot({ ...emptySnapshot(), budget })
+
+    expect(budgets).toEqual([budget])
+    app.stop()
+  })
+
+  test("Buildkite enabled with no token says it was skipped, once", async () => {
+    const { app, client, rendered, logs } = makePollerApp()
+    await app.initialize({ repositories: ["acme/widgets"] })
+    const message = "Buildkite: no token ($BUILDKITE_API_TOKEN or buildkite.token) — skipped"
+
+    expect(client.watches.at(-1)?.buildkite).toBeUndefined()
+    client.emitSnapshot(emptySnapshot())
+    client.emitSnapshot(emptySnapshot())
+
+    expect(rendered.at(-1)?.diagnostics).toContainEqual({
+      provider: "buildkite",
+      level: "info",
+      message,
+    })
+    expect(logs.filter((line) => line === message)).toHaveLength(1)
+    app.stop()
+  })
+
+  test("with a Buildkite token there is no skipped diagnostic", async () => {
+    process.env.BUILDKITE_API_TOKEN = "env-token"
+    const { app, client, rendered } = makePollerApp()
+    await app.initialize({ repositories: ["acme/widgets"] })
+
+    client.emitSnapshot(emptySnapshot())
+
+    const messages = (rendered.at(-1)?.diagnostics ?? []).map((d) => d.message)
+    expect(messages.some((m) => m.includes("no token"))).toBe(false)
+    app.stop()
+  })
+
   test("PRs are fetched on their own 30s timer, not per snapshot", async () => {
     let prCalls = 0
     const pr = { number: 1, title: "a PR", createdAt: "2026-09-17T10:00:00Z" }
