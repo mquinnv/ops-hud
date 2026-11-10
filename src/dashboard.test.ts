@@ -4,6 +4,7 @@ import blessed from "blessed"
 import { mkdtempSync } from "fs"
 import { tmpdir } from "os"
 import { join } from "path"
+import type { Budget } from "./poller/protocol.js"
 import type { Job, Run, Step } from "./types.js"
 
 // The Dashboard reads and writes ~/.ops-hud-prefs.json on construction and on
@@ -11,7 +12,7 @@ import type { Job, Run, Step } from "./types.js"
 const originalHome = process.env.HOME
 process.env.HOME = mkdtempSync(join(tmpdir(), "ops-hud-dashboard-test-"))
 
-const { Dashboard } = await import("./dashboard.js")
+const { Dashboard, budgetSegment } = await import("./dashboard.js")
 
 // Give blessed a throwaway input/output pair instead of the real terminal.
 // blessed still writes its enter/leave alternate-screen escape sequences,
@@ -507,5 +508,65 @@ describe("status-bar width", () => {
       expect(line).toContain("⚠ 2 errors")
       expect(line).not.toContain("HTTP 500")
     })
+  })
+})
+
+describe("budget segment", () => {
+  const now = Date.UTC(2026, 10, 9, 12, 0, 0)
+  const at = (ms: number): string =>
+    new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+  const budget = (partial: Partial<Budget> = {}): Budget => ({
+    provider: "github",
+    limit: 5000,
+    remaining: 4489,
+    resetAt: now + 30 * 60_000,
+    stretched: false,
+    ...partial,
+  })
+
+  test("shows remaining over limit and the reset time", () => {
+    expect(budgetSegment(budget(), undefined, now)).toBe(
+      ` | GH 4489/5000 · resets ${at(now + 30 * 60_000)}`,
+    )
+  })
+
+  test("a low budget is yellow and says slow", () => {
+    expect(budgetSegment(budget({ remaining: 230, stretched: true }), undefined, now)).toBe(
+      " | {yellow-fg}GH slow (budget low) 230/5000{/yellow-fg}",
+    )
+  })
+
+  test("a pause is red and names the time", () => {
+    const pausedUntil = now + 10 * 60_000
+    expect(
+      budgetSegment(budget({ pausedUntil, stretched: true }), { mode: "shared", message: "" }, now),
+    ).toBe(` | {red-fg}GH paused until ${at(pausedUntil)}{/red-fg}`)
+  })
+
+  test("an expired pause is ignored", () => {
+    expect(budgetSegment(budget({ pausedUntil: now - 1 }), undefined, now)).toContain("GH 4489")
+  })
+
+  test("in-process mode is appended", () => {
+    const status = { mode: "in-process" as const, message: "" }
+    expect(budgetSegment(budget(), status, now)).toEndWith(" | poller: in-process")
+    expect(budgetSegment(undefined, status, now)).toBe(" | poller: in-process")
+  })
+
+  test("no budget and shared mode renders nothing", () => {
+    expect(budgetSegment(undefined, undefined, now)).toBe("")
+    expect(budgetSegment(undefined, { mode: "shared", message: "" }, now)).toBe("")
+    expect(budgetSegment(budget({ limit: 0 }), undefined, now)).toBe("")
+  })
+
+  test("setBudget and setPollerStatus update the status line", () => {
+    const d = dashboard as unknown as { lastStatusLine1: string }
+    dashboard.setBudget(budget())
+    expect(d.lastStatusLine1).toContain("GH 4489/5000")
+    dashboard.setPollerStatus({ mode: "in-process", message: "" })
+    expect(d.lastStatusLine1).toContain("poller: in-process")
+    dashboard.setBudget(undefined)
+    dashboard.setPollerStatus({ mode: "shared", message: "" })
+    expect(d.lastStatusLine1).not.toContain("GH")
   })
 })

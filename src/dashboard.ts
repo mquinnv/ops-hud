@@ -3,6 +3,8 @@ import blessed from "blessed"
 import * as fs from "fs"
 import * as os from "os"
 import * as path from "path"
+import type { PollerStatus } from "./poller/client.js"
+import type { Budget } from "./poller/protocol.js"
 import type { ProviderDiagnostic } from "./providers/types.js"
 import { rerunVerb, runNoun } from "./run-wording.js"
 import { isActive, isTerminal, statusColor, statusIcon } from "./status.js"
@@ -38,6 +40,28 @@ function isDismissable(run: Run): boolean {
 /** The visible width of tagged content with no escaped braces in it. */
 function visibleLength(tagged: string): number {
   return tagged.replace(/\{\/?[\w\-,;!#]*\}/g, "").length
+}
+
+/** Status-bar field for the GitHub rate-limit budget and poller mode; "" when idle. */
+export function budgetSegment(
+  budget: Budget | undefined,
+  status: PollerStatus | undefined,
+  now: number,
+): string {
+  const time = (ms: number): string =>
+    new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+  let text = ""
+  if (budget && budget.limit > 0) {
+    if (budget.pausedUntil !== undefined && budget.pausedUntil > now) {
+      text = ` | {red-fg}GH paused until ${time(budget.pausedUntil)}{/red-fg}`
+    } else if (budget.stretched) {
+      text = ` | {yellow-fg}GH slow (budget low) ${budget.remaining}/${budget.limit}{/yellow-fg}`
+    } else {
+      text = ` | GH ${budget.remaining}/${budget.limit} · resets ${time(budget.resetAt)}`
+    }
+  }
+  if (status?.mode === "in-process") text += " | poller: in-process"
+  return text
 }
 
 export class Dashboard {
@@ -90,6 +114,8 @@ export class Dashboard {
   private refreshAnimationTimer?: NodeJS.Timeout // Timer for refresh animation
   private refreshAnimationFrame = 0 // Current frame of refresh animation
   private lastRefreshTime?: Date // Track when data was actually refreshed
+  private budget: Budget | undefined
+  private pollerStatus: PollerStatus | undefined
   private lastStatusLine1 = "" // Cache last status line to avoid re-rendering
   private lastStatusLine2 = "" // Cache last status line to avoid re-rendering
   private expandedJobs: Set<string> = new Set() // Expanded jobs, by Job.key (collapsed is the default)
@@ -2014,6 +2040,16 @@ Press '?', '/', or 'Esc' to close...`,
     return bare.length <= available ? ` | {red-fg}${bare.slice(3)}{/red-fg}` : ""
   }
 
+  setBudget(budget: Budget | undefined): void {
+    this.budget = budget
+    this.updateStatusBar()
+  }
+
+  setPollerStatus(status: PollerStatus): void {
+    this.pollerStatus = status
+    this.updateStatusBar()
+  }
+
   private updateStatusBar(): void {
     const runningCount = this.workflows.filter((w) => w.status === "running").length
     const queuedCount = this.workflows.filter((w) => w.status === "queued").length
@@ -2055,6 +2091,9 @@ Press '?', '/', or 'Esc' to close...`,
     ]
     let line1 = candidates.find((c) => visibleLength(c) <= width) ?? candidates[2]
     line1 += this.errorDiagnosticsSegment(width - visibleLength(line1))
+    // Whole segment or nothing: never truncate it mid-tag.
+    const budgetText = budgetSegment(this.budget, this.pollerStatus, Date.now())
+    if (visibleLength(line1) + visibleLength(budgetText) <= width) line1 += budgetText
 
     // Line 2: Context-aware keyboard shortcuts
     const shortcuts = this.getContextualShortcuts()
