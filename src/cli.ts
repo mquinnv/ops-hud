@@ -4,6 +4,7 @@ import { dirname, join } from "path"
 import { fileURLToPath } from "url"
 import { App } from "./app.js"
 import { resolveScope } from "./config.js"
+import { runPoller } from "./poller/main.js"
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const packageJson = JSON.parse(readFileSync(join(__dirname, "..", "package.json"), "utf-8"))
@@ -121,6 +122,12 @@ export function buildProgram(): Command {
 
   // Default command (same as watch)
   addWatchOptions(program).action(watch)
+
+  // Spawned by panes; one per machine and version, shared by all of them.
+  program
+    .command("__poller", { hidden: true })
+    .description("internal: shared poller")
+    .action(() => runPoller())
 
   return program
 }
