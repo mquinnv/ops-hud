@@ -510,7 +510,7 @@ describe("BuildkiteProvider.fetchRuns pipeline selection modes", () => {
     expect(requestedUrls.some((u) => u.includes("/pipelines?per_page"))).toBe(false)
   })
 
-  test("an explicit pipeline list wins over scope.repositories — the repo is never looked up in the index", async () => {
+  test("an explicit pipeline list is unioned with slugs derived from scope.repositories", async () => {
     const requestedUrls: string[] = []
     const provider = new BuildkiteProvider({
       token: "good",
@@ -518,8 +518,8 @@ describe("BuildkiteProvider.fetchRuns pipeline selection modes", () => {
       pipelines: ["explicit-slug"],
       fetch: async (url: string) => {
         requestedUrls.push(url)
-        if (url.includes("/pipelines/explicit-slug/builds"))
-          return jsonResponse([buildPayload("b1", 1)])
+        if (url.includes("/pipelines?")) return jsonResponse([usmPipeline])
+        if (url.includes("/builds")) return jsonResponse([buildPayload("b1", 1)])
         return jsonResponse([])
       },
     })
@@ -528,10 +528,8 @@ describe("BuildkiteProvider.fetchRuns pipeline selection modes", () => {
       repositories: ["inetalliance/usm"],
     })
 
-    expect(result.runs).toHaveLength(1)
     expect(requestedUrls.some((u) => u.includes("/pipelines/explicit-slug/builds"))).toBe(true)
-    // The index is never fetched at all — the explicit list bypasses it entirely.
-    expect(requestedUrls.some((u) => u.includes("/pipelines?per_page"))).toBe(false)
+    expect(requestedUrls.some((u) => u.includes("/pipelines/site-content-usm/builds"))).toBe(true)
     expect(result.diagnostics).toEqual([])
   })
 
@@ -1100,5 +1098,79 @@ describe("BuildkiteProvider request budget", () => {
     const result = await provider.fetchRuns(emptyScope)
     expect(requestedUrls).toHaveLength(1)
     expect(result.diagnostics).toHaveLength(1)
+  })
+})
+
+describe("per-call scope", () => {
+  function stub(requestedUrls: string[]) {
+    return async (url: string) => {
+      requestedUrls.push(url)
+      if (url.includes("/pipelines?")) return jsonResponse([usmPipeline])
+      return jsonResponse([])
+    }
+  }
+  const buildUrls = (urls: string[]) => urls.filter((u) => u.includes("/builds"))
+
+  test("scope.pipelines are fetched alongside slugs derived from scope.repositories", async () => {
+    const requestedUrls: string[] = []
+    const provider = new BuildkiteProvider({
+      token: "good",
+      org: "acme",
+      fetch: stub(requestedUrls),
+    })
+
+    await provider.fetchRuns({ repositories: ["inetalliance/usm"], pipelines: ["extra"] })
+
+    expect(buildUrls(requestedUrls)).toEqual([
+      "https://api.buildkite.com/v2/organizations/acme/pipelines/extra/builds?per_page=20",
+      "https://api.buildkite.com/v2/organizations/acme/pipelines/site-content-usm/builds?per_page=20",
+    ])
+  })
+
+  test("scope.pipelines replaces the constructor's pipelines when both are given", async () => {
+    const requestedUrls: string[] = []
+    const provider = new BuildkiteProvider({
+      token: "good",
+      org: "acme",
+      pipelines: ["from-constructor"],
+      fetch: stub(requestedUrls),
+    })
+
+    await provider.fetchRuns({ repositories: [], pipelines: ["from-scope"] })
+
+    expect(buildUrls(requestedUrls)).toEqual([
+      "https://api.buildkite.com/v2/organizations/acme/pipelines/from-scope/builds?per_page=20",
+    ])
+  })
+
+  test("the 'no pipeline builds X' diagnostic carries repository: X", async () => {
+    const provider = new BuildkiteProvider({
+      token: "good",
+      org: "acme",
+      fetch: stub([]),
+    })
+
+    const result = await provider.fetchRuns({ repositories: ["inetalliance/unknown"] })
+
+    expect(result.diagnostics).toHaveLength(1)
+    expect(result.diagnostics[0].repository).toBe("inetalliance/unknown")
+    expect(result.diagnostics[0].message).toContain("no pipeline in acme builds")
+  })
+
+  test("the 15s cache key includes scope.pipelines, so a different pipeline set is a new fetch", async () => {
+    const requestedUrls: string[] = []
+    const provider = new BuildkiteProvider({
+      token: "good",
+      org: "acme",
+      now: () => 1_000_000,
+      fetch: stub(requestedUrls),
+    })
+
+    await provider.fetchRuns({ repositories: [], pipelines: ["one"] })
+    await provider.fetchRuns({ repositories: [], pipelines: ["one"] })
+    expect(buildUrls(requestedUrls)).toHaveLength(1)
+
+    await provider.fetchRuns({ repositories: [], pipelines: ["two"] })
+    expect(buildUrls(requestedUrls)).toHaveLength(2)
   })
 })

@@ -6,7 +6,7 @@ import {
   mapGitHubJob,
   mapGitHubRun,
 } from "./github-map.js"
-import type { CiProvider, FetchResult, ProviderDiagnostic, Scope } from "./types.js"
+import type { CiProvider, CiReader, FetchResult, ProviderDiagnostic, Scope } from "./types.js"
 
 /**
  * The one way this provider reaches the outside world. A seam, so tests can
@@ -55,7 +55,7 @@ function describeFailure(error: unknown): string {
   return firstLine(e.stderr ?? "") || firstLine(e.shortMessage ?? e.message ?? String(error))
 }
 
-export class GitHubProvider implements CiProvider {
+export class GitHubProvider implements CiProvider, CiReader {
   readonly name = "github"
 
   private cache: Map<string, { data: unknown; timestamp: number }> = new Map()

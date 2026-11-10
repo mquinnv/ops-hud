@@ -9,7 +9,7 @@ import {
   mapBuildkiteBuild,
   mapBuildkiteJob,
 } from "./buildkite-map.js"
-import type { CiProvider, FetchResult, ProviderDiagnostic, Scope } from "./types.js"
+import type { CiProvider, CiReader, FetchResult, ProviderDiagnostic, Scope } from "./types.js"
 
 const API = "https://api.buildkite.com/v2"
 /** The token is only ever sent to this origin — never to a Link header or a
@@ -48,8 +48,8 @@ export interface BuildkiteProviderOptions {
   /** Auto-detected when the token reaches exactly one organization. */
   org?: string
   /**
-   * Explicit pipeline slugs. Non-empty wins over deriving slugs from
-   * `Scope.repositories`, in both scoped and unscoped modes.
+   * Explicit pipeline slugs, used when a call's `Scope.pipelines` is absent.
+   * Unioned with slugs derived from `Scope.repositories`.
    */
   pipelines?: string[]
   /** Injectable so tests never touch the network. */
@@ -161,7 +161,7 @@ function pickLogJob(jobs: BuildkiteJobPayload[]): BuildkiteJobPayload | undefine
   return withLog.length > 0 ? withLog[withLog.length - 1] : undefined
 }
 
-export class BuildkiteProvider implements CiProvider {
+export class BuildkiteProvider implements CiProvider, CiReader {
   readonly name = "buildkite"
 
   private readonly token?: string
@@ -204,7 +204,7 @@ export class BuildkiteProvider implements CiProvider {
     }
 
     const now = this.now()
-    const scopeKey = scope.repositories.join(",")
+    const scopeKey = `${scope.repositories.join(",")}|${(scope.pipelines ?? []).join(",")}`
     if (
       this.lastFetch &&
       this.lastFetch.scopeKey === scopeKey &&
@@ -254,12 +254,11 @@ export class BuildkiteProvider implements CiProvider {
     }
 
     const diagnostics: ProviderDiagnostic[] = []
-    // A configured pipeline list wins over deriving slugs from the scope, in
-    // both scoped and unscoped modes — it never touches the index.
-    let slugs: string[] | undefined
-    if (this.explicitPipelines.length > 0) {
-      slugs = this.explicitPipelines
-    } else if (scope.repositories.length > 0) {
+    // Explicit slugs (per call, else the constructor's) and slugs derived
+    // from the scope's repositories are unioned.
+    const explicit = scope.pipelines ?? this.explicitPipelines
+    const slugSet = new Set<string>(explicit)
+    if (scope.repositories.length > 0) {
       let index: Map<string, string[]>
       try {
         index = await this.getPipelineIndex(org)
@@ -267,7 +266,6 @@ export class BuildkiteProvider implements CiProvider {
         if (error instanceof RateLimited) throw error
         return { runs: [], diagnostics: [this.diagnoseFetchError(error)] }
       }
-      slugs = []
       for (const repo of scope.repositories) {
         const repoSlugs = index.get(repo)
         if (!repoSlugs || repoSlugs.length === 0) {
@@ -275,13 +273,17 @@ export class BuildkiteProvider implements CiProvider {
             provider: "buildkite",
             level: "info",
             message: `Buildkite: no pipeline in ${org} builds ${repo}`,
+            repository: repo,
           })
           continue
         }
-        slugs.push(...repoSlugs)
+        for (const slug of repoSlugs) slugSet.add(slug)
       }
     }
-    // Otherwise `slugs` stays undefined: unscoped, org-wide.
+    // Empty (no explicit slugs, no repositories): unscoped, org-wide. A scope
+    // whose repositories all lacked pipelines stays scoped to nothing.
+    const slugs: string[] | undefined =
+      explicit.length > 0 || scope.repositories.length > 0 ? [...slugSet] : undefined
 
     const builds: BuildkiteBuildPayload[] = []
     if (slugs && slugs.length <= MAX_PER_PIPELINE_SLUGS) {

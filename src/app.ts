@@ -10,7 +10,7 @@ import {
 } from "./providers/buildkite.js"
 import { GitHubProvider } from "./providers/github.js"
 import { applyIsFailing } from "./providers/github-map.js"
-import type { CiProvider, ProviderDiagnostic, Scope } from "./providers/types.js"
+import type { CiSource, ProviderDiagnostic, Scope } from "./providers/types.js"
 import { rerunVerb, runNoun } from "./run-wording.js"
 import { isActive, type RunStatus } from "./status.js"
 import type { DockerServiceStatus, Job, PullRequest, Run } from "./types.js"
@@ -25,7 +25,7 @@ const CLOCK_SKEW_GRACE_MS = 30_000
 /** Substitutions for the tests; production constructs every one of these. */
 export interface AppDependencies {
   github?: GitHubProvider
-  providers?: CiProvider[]
+  providers?: CiSource[]
   dockerService?: DockerServiceManager
   configManager?: ConfigManager
   dashboard?: Dashboard
@@ -33,24 +33,24 @@ export interface AppDependencies {
    * Seam for observing what the Buildkite provider was constructed with,
    * without touching the network. Production builds a real BuildkiteProvider.
    */
-  buildkiteFactory?: (options: BuildkiteProviderOptions) => CiProvider
+  buildkiteFactory?: (options: BuildkiteProviderOptions) => CiSource
   /** Clock, for deciding which runs happened while ops-hud was watching. */
   now?: () => number
 }
 
 export class App {
   // Pull requests and repository listing are GitHub-only concerns that are not
-  // on CiProvider, so the GitHub provider is also held by its concrete type.
+  // on CiSource, so the GitHub provider is also held by its concrete type.
   // Nothing on the CI path may reach through this field.
   private github: GitHubProvider
-  private providers: CiProvider[]
+  private providers: CiSource[]
   // True when AppDependencies.providers was supplied (the tests' seam). In
   // that case initialize() must never overwrite the injected list with one
   // built from config/flags. Recorded here, rather than inferred from array
   // contents, so an injected empty array or a single-provider list is just as
   // protected as any other.
   private readonly providersInjected: boolean
-  private readonly buildkiteFactory: (options: BuildkiteProviderOptions) => CiProvider
+  private readonly buildkiteFactory: (options: BuildkiteProviderOptions) => CiSource
   private dockerService: DockerServiceManager
   private configManager: ConfigManager
   private dashboard: Dashboard
@@ -181,8 +181,8 @@ export class App {
     noBuildkite?: boolean
     bkOrg?: string
     pipelines?: string[]
-  }): CiProvider[] {
-    const providers: CiProvider[] = []
+  }): CiSource[] {
+    const providers: CiSource[] = []
     if (!args.noGithub) {
       providers.push(this.github)
     }
@@ -506,7 +506,7 @@ export class App {
     })
   }
 
-  private providerFor(run: Run): CiProvider | undefined {
+  private providerFor(run: Run): CiSource | undefined {
     return this.providers.find((p) => p.name === run.provider)
   }
 
