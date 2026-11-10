@@ -27,6 +27,8 @@ export interface CoreDeps {
   now?: () => number
   /** Told about errors thrown by snapshot or budget listeners, which are otherwise swallowed. */
   onError?: (error: unknown) => void
+  /** One line per repo poll: `tick <repo> next=<ms>`, the delay until it is next due. */
+  log?: (line: string) => void
 }
 
 interface Client {
@@ -65,6 +67,7 @@ export class PollerCore {
   private readonly buildkiteFactory: CoreDeps["buildkiteFactory"]
   private readonly now: () => number
   private readonly onError: (error: unknown) => void
+  private readonly log: (line: string) => void
   private readonly clients = new Map<string, Client>()
   private readonly repos = new Map<string, Schedule>()
   private readonly instances = new Map<string, Instance>()
@@ -82,9 +85,15 @@ export class PollerCore {
     this.buildkiteFactory = deps.buildkiteFactory
     this.now = deps.now ?? Date.now
     this.onError = deps.onError ?? (() => {})
+    this.log = deps.log ?? (() => {})
   }
 
-  /** Replaces the client's subscription and sends it a snapshot of the current state at once. */
+  /**
+   * Replaces the client's subscription and sends it a snapshot of the current
+   * state at once. That snapshot carries the budget: publishBudget() only
+   * broadcasts changes, so a client joining with the budget unchanged gets it
+   * nowhere else.
+   */
   subscribe(clientId: string, subscription: Subscription): void {
     this.clients.set(clientId, { subscription })
     this.reconcile()
@@ -275,6 +284,7 @@ export class PollerCore {
     schedule.error = error
     schedule.lastDoneAt = this.now()
     schedule.multiplier = this.github.budget.multiplier()
+    this.log(`tick ${repo} next=${this.repoDueAt(repo, schedule) - schedule.lastDoneAt}`)
     this.publishAll()
   }
 

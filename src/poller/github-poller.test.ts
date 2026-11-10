@@ -440,6 +440,26 @@ describe("auth", () => {
     expect(p.state(REPO)?.diagnostics).toEqual([])
   })
 
+  test("repos polled together on a cold start share one resolution and all go out", async () => {
+    const OTHER = "mquinnv/other"
+    let resolves = 0
+    const f = fakeFetch(() => ({ status: 200, body: runsBody() }))
+    const p = new GitHubPoller({
+      fetch: f.fetch,
+      resolveToken: async () => {
+        resolves++
+        await new Promise((r) => setTimeout(r, 5))
+        return "tok"
+      },
+    })
+    await Promise.all([p.poll(REPO), p.poll(OTHER)])
+    expect(resolves).toBe(1)
+    expect(p.state(REPO)?.diagnostics).toEqual([])
+    expect(p.state(OTHER)?.diagnostics).toEqual([])
+    expect(f.callsTo(RUNS_URL)).toHaveLength(1)
+    expect(f.callsTo(`${GITHUB_API}/repos/${OTHER}/actions/runs?per_page=20`)).toHaveLength(1)
+  })
+
   test("a 401 re-resolves once; if that fails the state is unauthenticated", async () => {
     const tokens = ["old", "new"]
     let resolves = 0
@@ -551,5 +571,47 @@ describe("forget", () => {
     p.forget(REPO)
     expect(p.state(REPO)).toBeUndefined()
     expect(p.isActive(REPO)).toBe(false)
+  })
+})
+
+describe("log", () => {
+  test("one line per run-list response, with its status and the remaining budget", async () => {
+    const lines: string[] = []
+    const f = fakeFetch((_url, nth) =>
+      nth === 1
+        ? {
+            status: 200,
+            headers: {
+              etag: '"abc"',
+              "x-ratelimit-limit": "5000",
+              "x-ratelimit-remaining": "4999",
+            },
+            body: runsBody(),
+          }
+        : {
+            status: 304,
+            headers: {
+              etag: '"abc"',
+              "x-ratelimit-limit": "5000",
+              "x-ratelimit-remaining": "4998",
+            },
+          },
+    )
+    const p = new GitHubPoller({ fetch: f.fetch, resolveToken: token(), log: (l) => lines.push(l) })
+    await p.poll(REPO)
+    await p.poll(REPO)
+    expect(lines).toEqual([`poll ${REPO} 200 remaining=4999`, `poll ${REPO} 304 remaining=4998`])
+  })
+
+  test("a poll that sends nothing says why", async () => {
+    const lines: string[] = []
+    const f = fakeFetch(() => ({ status: 200, body: runsBody() }))
+    const p = new GitHubPoller({
+      fetch: f.fetch,
+      resolveToken: async () => undefined,
+      log: (l) => lines.push(l),
+    })
+    await p.poll(REPO)
+    expect(lines).toEqual([`poll ${REPO} unauthenticated remaining=0`])
   })
 })

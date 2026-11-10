@@ -44,11 +44,13 @@ export async function runPoller(): Promise<void> {
   const log = fileLogger(join(dirname(path), "poller.log"))
   const github = new GitHubPoller({
     resolveToken: () => resolveGitHubToken(process.env, (file, args) => execa(file, args)),
+    log,
   })
   const core = new PollerCore({
     github,
     buildkiteFactory: (opts) => new BuildkiteProvider(opts),
     onError: (error) => log(`error: ${messageOf(error)}`),
+    log,
   })
   const server = new PollerServer(core, {
     socketPath: path,

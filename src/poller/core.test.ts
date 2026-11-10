@@ -294,6 +294,33 @@ test("budget is broadcast when it changes and omitted from change detection", as
   expect(budgets).toHaveLength(budgetsBefore + 1)
 })
 
+test("a pane joining an established poller gets the current budget in its first snapshot", async () => {
+  core.subscribe("c1", sub(["o/a"]))
+  github.budget.record(limitHeaders(4_000))
+  await core.tick()
+  const budgetsBefore = budgets.length
+  core.subscribe("c2", sub(["o/a"]))
+  // No budget broadcast (nothing changed), so the snapshot is c2's only carrier.
+  expect(budgets).toHaveLength(budgetsBefore)
+  expect(snapshotsFor("c2")).toHaveLength(1)
+  expect(snapshotsFor("c2")[0].budget?.remaining).toBe(4_000)
+  expect(snapshotsFor("c2")[0].budget?.limit).toBe(5_000)
+})
+
+test("each repo poll logs the next tick it was given", async () => {
+  const lines: string[] = []
+  const logged = new PollerCore({
+    github,
+    buildkiteFactory: (opts) => new FakeBuildkite(opts),
+    now,
+    log: (line) => lines.push(line),
+  })
+  github.active.add("busy/r")
+  logged.subscribe("c1", sub(["idle/r", "busy/r"], { interval: 5_000 }))
+  await logged.tick()
+  expect(lines.sort()).toEqual(["tick busy/r next=5000", "tick idle/r next=15000"])
+})
+
 test("refresh polls now, at most once per 2s per repo", async () => {
   core.subscribe("c1", sub(["o/a", "o/b"], { interval: 60_000 }))
   await core.tick()
