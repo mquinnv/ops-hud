@@ -10,6 +10,8 @@ export interface ProviderDiagnostic {
   provider: string
   level: "info" | "error"
   message: string
+  /** "owner/repo" the diagnostic is about, when it is about one. */
+  repository?: string
 }
 
 export interface FetchResult {

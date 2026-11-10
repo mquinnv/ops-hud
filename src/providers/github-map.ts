@@ -11,6 +11,7 @@ export interface GitHubRunPayload {
   head_branch: string
   head_sha: string
   run_number: number
+  run_attempt?: number
   event?: string
   run_started_at?: string
   status: string
