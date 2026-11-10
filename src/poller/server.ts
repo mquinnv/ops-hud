@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, statSync, unlinkSync } from "node:fs"
+import { chmodSync, existsSync, mkdirSync, statSync, unlinkSync } from "node:fs"
 import { createConnection, createServer, type Server, type Socket } from "node:net"
 import { dirname } from "node:path"
 import type { PollerCore } from "./core.js"
@@ -26,17 +26,26 @@ export interface ServerOptions {
   onIdle?: () => void
 }
 
-/** Whether something is accepting connections on the socket path. */
-function answers(path: string): Promise<boolean> {
+/** How a connect to the socket path went: "connected", or the error code. */
+function probe(path: string): Promise<string> {
   return new Promise((resolve) => {
-    const probe = createConnection(path)
-    probe.once("connect", () => {
-      probe.destroy()
-      resolve(true)
+    const socket = createConnection(path)
+    socket.once("connect", () => {
+      socket.destroy()
+      resolve("connected")
     })
-    probe.once("error", () => resolve(false))
+    socket.once("error", (error: NodeJS.ErrnoException) => resolve(error.code ?? "EUNKNOWN"))
   })
 }
+
+/**
+ * A file that is there but refuses connections is a dead poller's socket.
+ * Node reports ECONNREFUSED for it; Bun reports ENOENT.
+ */
+const STALE: ReadonlySet<string> = new Set(["ECONNREFUSED", "ENOENT"])
+
+/** The first characters of a line a pane sent: enough to recognise, too few to hold a token. */
+const LOGGED_PREFIX = 20
 
 /** Who holds the socket path now: this server's file, nobody, or a newer poller. */
 type PathOwner = "ours" | "missing" | "other"
@@ -89,17 +98,31 @@ export class PollerServer {
   /** mkdir -p 0700 the directory; listen. Rejects with the EADDRINUSE error untouched. */
   async listen(): Promise<void> {
     mkdirSync(dirname(this.opts.socketPath), { recursive: true, mode: 0o700 })
-    // Node refuses to bind over a live socket (EADDRINUSE), but Bun silently
-    // replaces it, so ask first; a stale file is left to listen() to judge.
-    if (existsSync(this.opts.socketPath) && (await answers(this.opts.socketPath))) {
-      throw Object.assign(
-        new Error(`listen EADDRINUSE: address already in use ${this.opts.socketPath}`),
-        {
-          code: "EADDRINUSE",
-          syscall: "listen",
-          address: this.opts.socketPath,
-        },
-      )
+    // Node refuses to bind over any existing file (EADDRINUSE), live or not,
+    // and Bun silently replaces even a live socket, so ask first.
+    if (existsSync(this.opts.socketPath)) {
+      const outcome = await probe(this.opts.socketPath)
+      if (outcome === "connected") {
+        throw Object.assign(
+          new Error(`listen EADDRINUSE: address already in use ${this.opts.socketPath}`),
+          {
+            code: "EADDRINUSE",
+            syscall: "listen",
+            address: this.opts.socketPath,
+          },
+        )
+      }
+      // Nothing answers: a dead poller's file. listen(path) binds and listens
+      // in one call, so if another poller binds between this unlink and our
+      // bind, ours fails with EADDRINUSE and that poller serves the panes.
+      if (STALE.has(outcome)) {
+        try {
+          unlinkSync(this.opts.socketPath)
+          this.log(`removed stale socket file ${this.opts.socketPath}`)
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+        }
+      }
     }
     await new Promise<void>((resolve, reject) => {
       const onError = (error: Error) => reject(error)
@@ -108,6 +131,11 @@ export class PollerServer {
         this.server.off("error", onError)
         this.server.on("error", (error) => this.log(`server error: ${error.message}`))
         this.listening = true
+        // The directory is 0700 already; this keeps the socket owner-only
+        // even where that directory existed with looser permissions.
+        try {
+          chmodSync(this.opts.socketPath, 0o600)
+        } catch {}
         const { dev, ino } = statSync(this.opts.socketPath)
         this.identity = { dev, ino }
         this.checkTimer = setInterval(() => this.checkSocket(), this.socketCheckMs)
@@ -185,11 +213,18 @@ export class PollerServer {
     socket.on("data", (data: string) => {
       const { messages, bad, rest } = decodeLines(buffer + data)
       buffer = rest
-      for (const line of bad) this.log(`${clientId} bad line: ${line.slice(0, 200)}`)
+      // Never the whole line: a truncated watch line would put the Buildkite token in the log.
+      for (const line of bad) {
+        this.log(`${clientId} bad line (${line.length} chars): ${line.slice(0, LOGGED_PREFIX)}`)
+      }
       for (const message of messages) {
         if (socket.destroyed) return
         if (isPaneMessage(message)) this.handle(clientId, connection, message)
-        else this.log(`${clientId} unknown message: ${JSON.stringify(message).slice(0, 200)}`)
+        else {
+          const text = JSON.stringify(message)
+          const prefix = text.slice(0, LOGGED_PREFIX)
+          this.log(`${clientId} unknown message (${text.length} chars): ${prefix}`)
+        }
       }
       if (buffer.length > MAX_LINE_BYTES) {
         this.log(`${clientId} sent over 1 MiB without a newline; disconnecting`)

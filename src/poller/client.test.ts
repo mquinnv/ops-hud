@@ -397,3 +397,71 @@ test("a makeFallbackCore that throws leaves start() resolved and reports the fai
     process.off("unhandledRejection", onRejection)
   }
 })
+
+test("a stranded in-process client spawns a poller again on rejoin and ends shared", async () => {
+  const { server, core } = pollerServer()
+  const h = harness({
+    startupTimeoutMs: 100,
+    onSpawn: () => {
+      // The first spawned poller never comes up; the second does.
+      if (h.spawns === 2) void server.listen()
+    },
+  })
+  h.client.watch(subscription())
+  await h.client.start()
+  expect(h.statuses.at(-1)?.mode).toBe("in-process")
+  expect(h.spawns).toBe(1)
+  await waitFor(() => h.statuses.at(-1)?.mode === "shared")
+  expect(h.spawns).toBe(2)
+  await waitFor(() => core.clientCount === 1)
+  expect(h.fallbackCores).toHaveLength(1)
+  expect(h.fallbackCores[0].clientCount).toBe(0)
+})
+
+test("failed rejoins keep the one fallback core running rather than rebuilding it", async () => {
+  const h = harness({ startupTimeoutMs: 40, rejoinMs: 20 })
+  h.client.watch(subscription())
+  await h.client.start()
+  await waitFor(() => h.spawns >= 3)
+  expect(h.fallbackCores).toHaveLength(1)
+  expect(h.fallbackCores[0].clientCount).toBe(1)
+  expect(h.statuses.at(-1)?.mode).toBe("in-process")
+})
+
+test("a rejoin refused at hello keeps the running fallback core", async () => {
+  const h = harness({ startupTimeoutMs: 60, rejoinMs: 20 })
+  h.client.watch(subscription())
+  await h.client.start()
+  expect(h.fallbackCores).toHaveLength(1)
+  const core = makeCore()
+  cores.push(core)
+  const server = new PollerServer(core, { socketPath: path, version: "0.0.1" })
+  servers.push(server)
+  await server.listen()
+  await sleep(200)
+  expect(h.fallbackCores).toHaveLength(1)
+  expect(h.fallbackCores[0].clientCount).toBe(1)
+  expect(h.statuses.at(-1)?.mode).toBe("in-process")
+})
+
+test("on win32 the client polls in-process at once: no spawn, no connect, no wait", async () => {
+  let connects = 0
+  const h = harness({
+    platform: "win32",
+    startupTimeoutMs: 5_000,
+    rejoinMs: 10,
+    connect: () => {
+      connects++
+      return new Socket()
+    },
+  })
+  h.client.watch(subscription())
+  const started = Date.now()
+  await h.client.start()
+  expect(Date.now() - started).toBeLessThan(500)
+  expect(h.statuses.at(-1)?.mode).toBe("in-process")
+  expect(h.fallbackCores).toHaveLength(1)
+  await sleep(60)
+  expect(h.spawns).toBe(0)
+  expect(connects).toBe(0)
+})

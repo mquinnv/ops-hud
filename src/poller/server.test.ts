@@ -1,5 +1,14 @@
 import { afterEach, beforeEach, expect, test } from "bun:test"
-import { existsSync, mkdtempSync, renameSync, rmSync, unlinkSync } from "node:fs"
+import { spawn } from "node:child_process"
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  renameSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+} from "node:fs"
 import { createConnection, createServer, type Server, type Socket } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -251,6 +260,49 @@ test("listen() rejects with EADDRINUSE when another server holds the path", asyn
   expect(existsSync(path)).toBe(true)
   const client = await watcher()
   expect((await client.next()).type).toBe("snapshot")
+})
+
+/** Leaves a socket file at `path` that nothing answers: its poller was SIGKILLed. */
+async function staleSocket(): Promise<void> {
+  mkdirSync(join(dir, "s"), { recursive: true })
+  const script = `require("net").createServer().listen(${JSON.stringify(path)}, () => console.log("up"))`
+  const child = spawn(process.execPath, ["-e", script], { stdio: ["ignore", "pipe", "ignore"] })
+  await new Promise((resolve) => child.stdout.once("data", resolve))
+  child.kill("SIGKILL")
+  await new Promise((resolve) => child.once("exit", resolve))
+  expect(existsSync(path)).toBe(true)
+}
+
+test("listen() succeeds over a stale socket file that nothing answers", async () => {
+  await staleSocket()
+  await server().listen()
+  expect(logs.some((line) => line.includes("removed stale socket file"))).toBe(true)
+  const client = await watcher()
+  expect((await client.next()).type).toBe("snapshot")
+})
+
+test.skipIf(process.platform === "win32")(
+  "the socket file is owner-only after listen",
+  async () => {
+    await server().listen()
+    expect(statSync(path).mode & 0o777).toBe(0o600)
+  },
+)
+
+test("a malformed line is logged by length and a short prefix only", async () => {
+  await server().listen()
+  const client = await connect()
+  const secret = "tok_SECRET_SHOULD_NOT_BE_LOGGED"
+  const line = `{"type":"watch","subscription":{"buildkite":{"token":"${secret}"`
+  client.send(`${line}\n`)
+  client.send({ type: "hello", version: VERSION, pid: 1 })
+  client.send({ type: "watch", subscription: subscription() })
+  expect((await client.next()).type).toBe("snapshot")
+  const logged = logs.find((l) => l.includes("bad line"))
+  expect(logged).toContain(`${line.length} chars`)
+  expect(logged).toContain(line.slice(0, 20))
+  expect(logged).not.toContain(line.slice(0, 21))
+  expect(logs.some((l) => l.includes(secret))).toBe(false)
 })
 
 test("close() removes the socket file", async () => {

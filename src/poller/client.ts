@@ -132,6 +132,8 @@ export interface SocketClientOptions {
   /** mtime lookup, injectable; default fs.statSync */
   mtimeOf?: (path: string) => number | undefined
   unlink?: (path: string) => void
+  /** Default process.platform. On win32 there is no Unix socket: the client polls in-process. */
+  platform?: string
 }
 
 type Queued =
@@ -178,6 +180,7 @@ export class SocketPollerClient implements PollerClient {
   private readonly staleSocketMs: number
   private readonly mtimeOf: (path: string) => number | undefined
   private readonly unlink: (path: string) => void
+  private readonly platform: string
   private readonly snapshots = new Listeners<Snapshot>()
   private readonly budgets = new Listeners<Budget>()
   private readonly statuses = new Listeners<PollerStatus>()
@@ -203,18 +206,21 @@ export class SocketPollerClient implements PollerClient {
     this.staleSocketMs = opts.staleSocketMs ?? STALE_SOCKET_MS
     this.mtimeOf = opts.mtimeOf ?? defaultMtimeOf
     this.unlink = opts.unlink ?? defaultUnlink
+    this.platform = opts.platform ?? process.platform
   }
 
   /** Runs the startup procedure; resolves once connected or once the fallback is in place. Never rejects. */
   start(): Promise<void> {
-    this.starting ??= this.startup()
+    this.starting ??= this.platform === "win32" ? this.startInProcess() : this.startup()
     return this.starting
   }
 
   watch(subscription: Subscription): void {
     this.subscription = subscription
     if (this.socket) this.send({ type: "watch", subscription })
-    else this.fallback?.watch(subscription)
+    // A fallback still running while a rejoined socket proves itself keeps
+    // the subscription too, in case that socket is refused.
+    this.fallback?.watch(subscription)
   }
 
   refresh(repositories?: string[]): void {
@@ -255,8 +261,24 @@ export class SocketPollerClient implements PollerClient {
     this.queue = []
   }
 
-  /** Steps 1-4 of the spec: connect, else stale check + spawn once, retry until the timeout, else fall back. */
+  /** Steps 1-4 of the spec: reach the poller, else fall back. */
   private async startup(): Promise<void> {
+    const socket = await this.establish()
+    if (this.closed) socket?.destroy()
+    else if (socket) this.attach(socket)
+    else this.fallBack()
+  }
+
+  /** win32: no Unix socket to share, so poll here from the start and never rejoin. */
+  private async startInProcess(): Promise<void> {
+    if (!this.closed) this.fallBack()
+  }
+
+  /**
+   * Steps 1-3 of the spec: connect, else stale check + spawn once, retry
+   * until the timeout. The socket, or undefined when the poller stayed out of reach.
+   */
+  private async establish(): Promise<Socket | undefined> {
     let timedOut = false
     this.later(this.startupTimeoutMs, () => {
       timedOut = true
@@ -265,10 +287,7 @@ export class SocketPollerClient implements PollerClient {
     while (!this.closed) {
       const attempt = await this.attempt()
       if (this.closed) break
-      if ("socket" in attempt) {
-        this.attach(attempt.socket)
-        return
-      }
+      if ("socket" in attempt) return attempt.socket
       if (!RETRYABLE.has(attempt.code) || timedOut) break
       if (!spawned) {
         spawned = true
@@ -277,7 +296,7 @@ export class SocketPollerClient implements PollerClient {
       await this.sleep(this.retryMs)
       if (timedOut) break
     }
-    if (!this.closed) this.fallBack()
+    return undefined
   }
 
   /** Removes a stale socket file and spawns the poller; false when that cannot be done safely. */
@@ -319,8 +338,14 @@ export class SocketPollerClient implements PollerClient {
     })
   }
 
+  /**
+   * Makes `socket` the connection. A fallback that is running (a rejoin) is
+   * kept until the poller's first message, so a poller that refuses this pane
+   * at hello leaves it polling here without rebuilding its core.
+   */
   private attach(socket: Socket): void {
     this.socket = socket
+    const proving = this.fallback !== undefined
     let received = false
     let buffer = ""
     socket.setEncoding("utf8")
@@ -328,7 +353,10 @@ export class SocketPollerClient implements PollerClient {
       const { messages, rest } = decodeLines(buffer + data)
       buffer = rest
       for (const message of messages) {
-        received = true
+        if (!received) {
+          received = true
+          if (this.socket === socket) this.retireFallback()
+        }
         if (isPollerMessage(message)) this.receive(message)
       }
       if (buffer.length > MAX_INBOUND_BYTES) socket.destroy()
@@ -338,6 +366,15 @@ export class SocketPollerClient implements PollerClient {
     this.send({ type: "hello", version: this.opts.version, pid: process.pid })
     if (this.subscription) this.send({ type: "watch", subscription: this.subscription })
     this.flush()
+    if (!proving) this.statuses.emit({ mode: "shared", message: "connected to the shared poller" })
+  }
+
+  /** The shared poller has answered: the in-process core is no longer needed. */
+  private retireFallback(): void {
+    const fallback = this.fallback
+    if (!fallback) return
+    this.fallback = undefined
+    fallback.close()
     this.statuses.emit({ mode: "shared", message: "connected to the shared poller" })
   }
 
@@ -363,9 +400,11 @@ export class SocketPollerClient implements PollerClient {
     this.socket = undefined
     this.abandonOlder()
     // A poller that hangs up before saying anything has most likely refused us
-    // (e.g. a version mismatch); reconnecting at once would only loop.
+    // (e.g. a version mismatch); reconnecting at once would only loop. A
+    // fallback still running from before this rejoin carries on as it was.
     if (!received) {
-      this.fallBack()
+      if (this.fallback) this.scheduleRejoin()
+      else this.fallBack()
       return
     }
     this.statuses.emit({ mode: "shared", message: "poller gone, reconnecting" })
@@ -385,31 +424,36 @@ export class SocketPollerClient implements PollerClient {
       return
     }
     const fallback = new InProcessPollerClient(core)
-    fallback.onSnapshot((snapshot) => this.snapshots.emit(snapshot))
-    fallback.onBudget((budget) => this.budgets.emit(budget))
+    // Silent while a rejoined socket is on probation: the socket speaks for the pane.
+    fallback.onSnapshot((snapshot) => {
+      if (!this.socket) this.snapshots.emit(snapshot)
+    })
+    fallback.onBudget((budget) => {
+      if (!this.socket) this.budgets.emit(budget)
+    })
     this.fallback = fallback
     this.statuses.emit({ mode: "in-process", message: "shared poller unavailable; polling here" })
     if (this.subscription) fallback.watch(this.subscription)
     this.flush()
-    this.scheduleRejoin()
+    if (this.platform !== "win32") this.scheduleRejoin()
   }
 
   private scheduleRejoin(): void {
     this.later(this.rejoinMs, () => void this.rejoin())
   }
 
-  /** One step-5 attempt; never rejects, and reschedules itself until it succeeds. */
+  /**
+   * Step 5: the whole startup procedure again (connect, stale check and one
+   * spawn, retry until the timeout), so a pane stranded in-process starts a
+   * poller rather than waiting for another pane to. The fallback keeps running
+   * throughout; never rejects, and reschedules itself until it succeeds.
+   */
   private async rejoin(): Promise<void> {
     try {
-      const attempt = await this.attempt()
-      if (this.closed) return
-      if (!("socket" in attempt)) {
-        this.scheduleRejoin()
-        return
-      }
-      this.fallback?.close()
-      this.fallback = undefined
-      this.attach(attempt.socket)
+      const socket = await this.establish()
+      if (this.closed) socket?.destroy()
+      else if (socket) this.attach(socket)
+      else this.scheduleRejoin()
     } catch {
       if (!this.closed && !this.socket) this.scheduleRejoin()
     }
