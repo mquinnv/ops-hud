@@ -45,10 +45,10 @@ export const STALE_SOCKET_MS = 5_000
 export const MAX_INBOUND_BYTES = 16 * 1024 * 1024
 
 const LOCAL_CLIENT_ID = "local"
-const DISCONNECTED: FetchResult = {
+const disconnected = (): FetchResult => ({
   runs: [],
   diagnostics: [{ provider: "github", level: "error", message: "poller disconnected" }],
-}
+})
 
 /** Listener fan-out; a throwing listener must not break the socket or the core. */
 class Listeners<T> {
@@ -222,7 +222,7 @@ export class SocketPollerClient implements PollerClient {
   }
 
   older(repositories: string[], before: string, limit: number): Promise<FetchResult> {
-    if (this.closed) return Promise.resolve(DISCONNECTED)
+    if (this.closed) return Promise.resolve(disconnected())
     return new Promise((resolve) =>
       this.dispatch({ type: "older", repositories, before, limit, resolve }),
     )
@@ -251,7 +251,7 @@ export class SocketPollerClient implements PollerClient {
     this.fallback?.close()
     this.fallback = undefined
     this.abandonOlder()
-    for (const item of this.queue) if (item.type === "older") item.resolve(DISCONNECTED)
+    for (const item of this.queue) if (item.type === "older") item.resolve(disconnected())
     this.queue = []
   }
 
@@ -362,9 +362,9 @@ export class SocketPollerClient implements PollerClient {
     if (this.socket !== socket || this.closed) return
     this.socket = undefined
     this.abandonOlder()
-    // A poller that hangs up before saying anything after a watch refused us
+    // A poller that hangs up before saying anything has most likely refused us
     // (e.g. a version mismatch); reconnecting at once would only loop.
-    if (!received && this.subscription) {
+    if (!received) {
       this.fallBack()
       return
     }
@@ -374,7 +374,17 @@ export class SocketPollerClient implements PollerClient {
 
   /** Step 4: run the core here; step 5: keep trying the socket every rejoinMs. */
   private fallBack(): void {
-    const fallback = new InProcessPollerClient(this.opts.makeFallbackCore())
+    let core: PollerCore
+    try {
+      core = this.opts.makeFallbackCore()
+    } catch (error) {
+      // Nothing can poll: report it and go inert (close() answers later calls) rather than reject.
+      const reason = error instanceof Error ? error.message : String(error)
+      this.statuses.emit({ mode: "in-process", message: `poller unavailable: ${reason}` })
+      this.close()
+      return
+    }
+    const fallback = new InProcessPollerClient(core)
     fallback.onSnapshot((snapshot) => this.snapshots.emit(snapshot))
     fallback.onBudget((budget) => this.budgets.emit(budget))
     this.fallback = fallback
@@ -385,7 +395,12 @@ export class SocketPollerClient implements PollerClient {
   }
 
   private scheduleRejoin(): void {
-    this.later(this.rejoinMs, async () => {
+    this.later(this.rejoinMs, () => void this.rejoin())
+  }
+
+  /** One step-5 attempt; never rejects, and reschedules itself until it succeeds. */
+  private async rejoin(): Promise<void> {
+    try {
       const attempt = await this.attempt()
       if (this.closed) return
       if (!("socket" in attempt)) {
@@ -395,7 +410,9 @@ export class SocketPollerClient implements PollerClient {
       this.fallback?.close()
       this.fallback = undefined
       this.attach(attempt.socket)
-    })
+    } catch {
+      if (!this.closed && !this.socket) this.scheduleRejoin()
+    }
   }
 
   private dispatch(item: Queued): void {
@@ -433,7 +450,7 @@ export class SocketPollerClient implements PollerClient {
   }
 
   private abandonOlder(): void {
-    for (const resolve of this.inFlight.values()) resolve(DISCONNECTED)
+    for (const resolve of this.inFlight.values()) resolve(disconnected())
     this.inFlight.clear()
   }
 

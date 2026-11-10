@@ -359,3 +359,41 @@ test("a poller that hangs up on hello (version mismatch) leaves the client in-pr
   expect(h.fallbackCores).toHaveLength(1)
   expect(core.clientCount).toBe(0)
 })
+
+test("a poller that refuses hello before any watch does not cause a reconnect loop", async () => {
+  const core = makeCore()
+  cores.push(core)
+  const server = new PollerServer(core, { socketPath: path, version: "0.0.1" })
+  servers.push(server)
+  await server.listen()
+  const h = harness({ rejoinMs: 10_000 })
+  await h.client.start()
+  await waitFor(() => h.statuses.at(-1)?.mode === "in-process")
+  await sleep(100)
+  expect(h.statuses.length).toBeLessThan(6)
+  expect(h.statuses.at(-1)?.mode).toBe("in-process")
+  expect(h.spawns).toBeLessThanOrEqual(1)
+  expect(h.fallbackCores).toHaveLength(1)
+})
+
+test("a makeFallbackCore that throws leaves start() resolved and reports the failure", async () => {
+  const rejections: unknown[] = []
+  const onRejection = (reason: unknown) => rejections.push(reason)
+  process.on("unhandledRejection", onRejection)
+  try {
+    const h = harness({
+      startupTimeoutMs: 60,
+      makeFallbackCore: () => {
+        throw new Error("no token")
+      },
+    })
+    await h.client.start()
+    expect(h.statuses.some((s) => s.message.includes("no token"))).toBe(true)
+    const older = await h.client.older([REPO], "2024-01-01T00:00:00Z", 1)
+    expect(older.diagnostics[0].level).toBe("error")
+    await sleep(20)
+    expect(rejections).toEqual([])
+  } finally {
+    process.off("unhandledRejection", onRejection)
+  }
+})
