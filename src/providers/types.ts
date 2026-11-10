@@ -35,18 +35,12 @@ export interface CiProvider {
   logs(run: Run): Promise<string>
 }
 
-/** The read path. Lives in the poller process. BuildkiteProvider implements it; GitHubProvider stops doing so in Task 9. */
+/**
+ * The read path. Lives in the poller process: BuildkiteProvider implements it;
+ * GitHub runs are read by the poller's own GitHubPoller.
+ */
 export interface CiReader {
   readonly name: string
   fetchRuns(scope: Scope): Promise<FetchResult>
   fetchJobs(run: Run): Promise<Job[]>
 }
-
-/**
- * What App holds until Task 9 rewrites it. `fetchOlderRuns` is optional: only
- * GitHub can page backwards, and one that omits it sits resurrect out.
- */
-export type CiSource = CiProvider &
-  CiReader & {
-    fetchOlderRuns?(scope: Scope, before: string, limit: number): Promise<FetchResult>
-  }

@@ -3,6 +3,8 @@ import { promisify } from "util"
 import { ConfigManager } from "./config.js"
 import { Dashboard } from "./dashboard.js"
 import { DockerServiceManager } from "./docker-utils.js"
+import { createPollerClient, type PollerClient } from "./poller/client.js"
+import type { BuildkiteSubscription, Snapshot } from "./poller/protocol.js"
 import {
   BuildkiteProvider,
   type BuildkiteProviderOptions,
@@ -10,10 +12,11 @@ import {
 } from "./providers/buildkite.js"
 import { GitHubProvider } from "./providers/github.js"
 import { applyIsFailing } from "./providers/github-map.js"
-import type { CiSource, ProviderDiagnostic, Scope } from "./providers/types.js"
+import type { CiProvider, ProviderDiagnostic } from "./providers/types.js"
 import { rerunVerb, runNoun } from "./run-wording.js"
 import { isActive, type RunStatus } from "./status.js"
 import type { DockerServiceStatus, Job, PullRequest, Run } from "./types.js"
+import { readPackageVersion } from "./version.js"
 
 const execAsync = promisify(exec)
 
@@ -22,10 +25,13 @@ const execAsync = promisify(exec)
 // disagree by a few seconds.
 const CLOCK_SKEW_GRACE_MS = 30_000
 
+/** Pull requests are polled by the pane on their own timer, apart from CI runs. */
+export const PR_REFRESH_MS = 30_000
+
 /** Substitutions for the tests; production constructs every one of these. */
 export interface AppDependencies {
   github?: GitHubProvider
-  providers?: CiSource[]
+  providers?: CiProvider[]
   dockerService?: DockerServiceManager
   configManager?: ConfigManager
   dashboard?: Dashboard
@@ -33,31 +39,46 @@ export interface AppDependencies {
    * Seam for observing what the Buildkite provider was constructed with,
    * without touching the network. Production builds a real BuildkiteProvider.
    */
-  buildkiteFactory?: (options: BuildkiteProviderOptions) => CiSource
+  buildkiteFactory?: (options: BuildkiteProviderOptions) => CiProvider
   /** Clock, for deciding which runs happened while ops-hud was watching. */
   now?: () => number
+  /**
+   * Where runs come from. Absent, initialize() builds the production client,
+   * which joins or spawns the shared poller process.
+   */
+  pollerClient?: PollerClient
 }
 
 export class App {
   // Pull requests and repository listing are GitHub-only concerns that are not
-  // on CiSource, so the GitHub provider is also held by its concrete type.
-  // Nothing on the CI path may reach through this field.
+  // on CiProvider, so the GitHub provider is also held by its concrete type.
   private github: GitHubProvider
-  private providers: CiSource[]
+  // The pane-side actions (cancel, rerun, logs). Runs themselves come from
+  // the poller, never from these.
+  private providers: CiProvider[]
   // True when AppDependencies.providers was supplied (the tests' seam). In
   // that case initialize() must never overwrite the injected list with one
   // built from config/flags. Recorded here, rather than inferred from array
   // contents, so an injected empty array or a single-provider list is just as
   // protected as any other.
   private readonly providersInjected: boolean
-  private readonly buildkiteFactory: (options: BuildkiteProviderOptions) => CiSource
+  private readonly buildkiteFactory: (options: BuildkiteProviderOptions) => CiProvider
+  // What the Buildkite provider was built with, passed on to the poller.
+  // Undefined when Buildkite is off or has no token.
+  private buildkiteSubscription?: BuildkiteSubscription
+  private pollerClient?: PollerClient
   private dockerService: DockerServiceManager
   private configManager: ConfigManager
   private dashboard: Dashboard
-  private refreshInterval?: NodeJS.Timeout
+  private prTimer?: NodeJS.Timeout
+  private dockerTimer?: NodeJS.Timeout
+  private prPollInFlight = false
+  private dockerPollInFlight = false
+  // PR and Docker polls only re-render once a snapshot has drawn the grid;
+  // before that they just store their data for the first snapshot to show.
+  private hasSnapshot = false
   private repositories: string[] = []
   private jobs: Map<string, Job[]> = new Map() // Keyed by Run.key
-  private isRefreshing = false
   private watchedWorkflows: Set<string> = new Set() // Run keys we've been watching
   private completedWorkflows: Map<string, Run> = new Map() // Keep finished runs until dismissed
   // When ops-hud started watching. A run that finished after this happened
@@ -99,6 +120,8 @@ export class App {
     // one (the tests) must be able to keep that from happening.
     this.dashboard = deps.dashboard ?? new Dashboard()
     this.watchingSince = (deps.now ?? Date.now)()
+    // Never constructed here: the production client is built in initialize().
+    this.pollerClient = deps.pollerClient
   }
 
   async initialize(args: {
@@ -164,11 +187,38 @@ export class App {
     // Set up event handlers
     this.setupEventHandlers()
 
-    // Initial fetch
-    await this.performRefresh(false)
+    // Runs come from the poller from here on; the pane never fetches them.
+    this.pollerClient ??= createPollerClient({ version: readPackageVersion() })
+    const client = this.pollerClient
+    client.onSnapshot((snapshot) => this.applySnapshot(snapshot))
+    client.onBudget((budget) => this.dashboard.setBudget(budget))
+    client.onStatus((status) => {
+      this.dashboard.setPollerStatus(status)
+      this.dashboard.log(status.message, "info")
+    })
+    await client.start?.()
+    // Straight after start, with no await in between: a poller that dies
+    // before the first watch sends the pane in-process until the next rejoin.
+    client.watch({
+      repositories: this.repositories,
+      interval: this.configManager.refreshInterval,
+      github: !args.noGithub,
+      ...(this.buildkiteSubscription ? { buildkite: this.buildkiteSubscription } : {}),
+    })
 
-    // Start auto-refresh
-    this.startAutoRefresh()
+    if (this.showPRs) {
+      void this.pollPullRequests()
+      this.prTimer = setInterval(() => void this.pollPullRequests(), PR_REFRESH_MS)
+      this.prTimer.unref()
+    }
+    if (this.showDocker) {
+      void this.pollDocker()
+      this.dockerTimer = setInterval(
+        () => void this.pollDocker(),
+        this.configManager.refreshInterval,
+      )
+      this.dockerTimer.unref()
+    }
   }
 
   /**
@@ -181,28 +231,38 @@ export class App {
     noBuildkite?: boolean
     bkOrg?: string
     pipelines?: string[]
-  }): CiSource[] {
-    const providers: CiSource[] = []
+  }): CiProvider[] {
+    const providers: CiProvider[] = []
+    this.buildkiteSubscription = undefined
     if (!args.noGithub) {
       providers.push(this.github)
     }
     if (!args.noBuildkite) {
       const buildkiteConfig = this.configManager.buildkite
-      providers.push(
-        this.buildkiteFactory({
-          token: resolveBuildkiteToken(process.env, buildkiteConfig),
-          org: args.bkOrg ?? buildkiteConfig.org,
-          pipelines: args.pipelines ?? buildkiteConfig.pipelines,
-        }),
-      )
+      const options = {
+        token: resolveBuildkiteToken(process.env, buildkiteConfig),
+        org: args.bkOrg ?? buildkiteConfig.org,
+        pipelines: args.pipelines ?? buildkiteConfig.pipelines,
+      }
+      providers.push(this.buildkiteFactory(options))
+      if (options.token) {
+        this.buildkiteSubscription = {
+          token: options.token,
+          org: options.org,
+          pipelines: options.pipelines,
+        }
+      }
     }
     return providers
   }
 
   private setupEventHandlers(): void {
-    // Handle manual refresh - but make sure it's only called explicitly
+    // Manual refresh: ask the poller now; PRs and Docker are re-read too.
     this.dashboard.onRefresh(() => {
-      this.performRefresh(true)
+      this.dashboard.showLoadingInStatus()
+      this.pollerClient?.refresh()
+      if (this.showPRs) void this.pollPullRequests()
+      if (this.showDocker) void this.pollDocker()
     })
 
     // Handle application exit
@@ -282,8 +342,8 @@ export class App {
         await provider.cancel(run)
 
         this.dashboard.log(`Successfully cancelled ${noun} ${run.id}`, "info")
-        // Force refresh to update the status
-        await this.performRefresh(true)
+        // Have the poller look at this repository again now
+        this.pollerClient?.refresh([run.repo.fullName])
       } catch (error) {
         this.dashboard.log(`Failed to cancel ${noun}: ${error}`, "error")
       }
@@ -393,8 +453,8 @@ export class App {
           const target = dockerService.isProject ? `project ${repo}` : `service ${serviceName}`
           this.dashboard.log(`Successfully completed ${action} on ${target}`, "info")
 
-          // Force refresh to update the status
-          await this.performRefresh(true)
+          // Re-read Docker status to show the change
+          await this.pollDocker()
         } catch (error) {
           this.dashboard.log(`Failed to ${action} Docker service: ${error}`, "error")
         }
@@ -411,7 +471,7 @@ export class App {
         await execAsync(command)
 
         this.dashboard.log(`Successfully merged PR #${pr.number}`, "info")
-        await this.performRefresh(true)
+        await this.pollPullRequests()
       } catch (error) {
         this.dashboard.log(`Failed to merge PR: ${error}`, "error")
       }
@@ -449,7 +509,7 @@ export class App {
           this.dashboard.log(`Successfully converted PR #${pr.number} to draft`, "info")
         }
 
-        await this.performRefresh(true)
+        await this.pollPullRequests()
       } catch (error) {
         this.dashboard.log(`Failed to ${action} PR: ${error}`, "error")
       }
@@ -469,7 +529,7 @@ export class App {
         await provider.rerun(run)
 
         this.dashboard.log(`Successfully triggered a ${verb} of ${run.id}`, "info")
-        await this.performRefresh(true)
+        this.pollerClient?.refresh([run.repo.fullName])
       } catch (error) {
         this.dashboard.log(`Failed to trigger a ${verb}: ${error}`, "error")
       }
@@ -506,177 +566,156 @@ export class App {
     })
   }
 
-  private providerFor(run: Run): CiSource | undefined {
+  private providerFor(run: Run): CiProvider | undefined {
     return this.providers.find((p) => p.name === run.provider)
   }
 
-  private currentScope(): Scope {
-    return { repositories: this.repositories }
-  }
-
-  private async performRefresh(_isManual: boolean = false): Promise<void> {
-    // Don't refresh if a modal is open
+  /**
+   * One poll's worth of runs from the poller: tracks what was watched,
+   * finished and dismissed, then renders. Every snapshot goes through this,
+   * even one identical to the last.
+   */
+  applySnapshot(snapshot: Snapshot): void {
+    // Don't re-render under an open modal; the next snapshot catches up.
     if (this.dashboard.isModalOpen()) return
 
-    if (this.isRefreshing) return
-    this.isRefreshing = true
-
-    // Show loading in status bar instead of blocking dialog
-    this.dashboard.showLoadingInStatus()
-
-    try {
-      // Fetch recent runs from every configured provider
-      const scope = this.currentScope()
-      const results = await Promise.all(this.providers.map((provider) => provider.fetchRuns(scope)))
-
-      const allRuns: Run[] = []
-      const providerJobs = new Map<string, Job[]>()
-      for (const result of results) {
-        allRuns.push(...result.runs)
-        // Providers that embed jobs in their run payloads save us a round trip.
-        if (result.jobs) {
-          for (const [key, jobs] of result.jobs) {
-            providerJobs.set(key, jobs)
-          }
-        }
-      }
-      const diagnostics = results.flatMap((result) => result.diagnostics)
-      if (this.buildkiteDisabled) {
-        diagnostics.push({
-          provider: "buildkite",
-          level: "info",
-          message: "Buildkite: disabled (--no-buildkite)",
-        })
-      }
-      this.logChangedDiagnostics(diagnostics)
-      allRuns.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
-
-      // Kept for the empty-state panel: a Buildkite misconfiguration on a
-      // checkout with no GitHub Actions runs must not look like idle CI.
-      this.lastDiagnostics = diagnostics
-
-      // Fetch PRs if requested
-      if (this.showPRs) {
-        this.pullRequests = await this.github.getAllPullRequests(this.repositories)
-      }
-
-      // Fetch Docker services if requested
-      if (this.showDocker) {
-        this.dashboard.log(
-          `Checking Docker services for repositories: ${this.repositories.join(", ")}`,
-          "debug",
-        )
-        this.dockerServices = await this.dockerService.getAllDockerStatus(
-          this.repositories,
-          (msg) => this.dashboard.log(msg, "debug"),
-        )
-        const totalServices = this.dockerServices.reduce((acc, ds) => acc + ds.services.length, 0)
-        const logLevel = this.dockerServices.length > 0 ? "info" : "debug"
-        this.dashboard.log(
-          `Found ${this.dockerServices.length} compose files, ${totalServices} total services`,
-          logLevel,
-        )
-
-        // Log which repos have Docker services
-        if (this.dockerServices.length > 0) {
-          const reposWithDocker = [...new Set(this.dockerServices.map((ds) => ds.repository))]
-          this.dashboard.log(`Docker services found in: ${reposWithDocker.join(", ")}`, "debug")
-        }
-      }
-
-      // Update watched and completed trackers, keyed by Run.key: ids are only
-      // unique within a provider.
-      for (const run of allRuns) {
-        if (isActive(run.status)) {
-          this.watchedWorkflows.add(run.key)
-          // Running again (a GitHub rerun keeps its key): an earlier
-          // dismissal no longer applies.
-          this.dismissedRuns.delete(run.key)
-        } else if (
-          !this.completedWorkflows.has(run.key) &&
-          !this.dismissedRuns.has(run.key) &&
-          (this.watchedWorkflows.has(run.key) || this.finishedInWindow(run))
-        ) {
-          // Reached a verdict while being watched
-          this.completedWorkflows.set(run.key, run)
-        }
-      }
-
-      // Track the oldest timestamp for resurrect, from the providers that can
-      // page backwards only: an old Buildkite build in the merged list would
-      // otherwise make resurrect ask GitHub for runs older than that, and
-      // skip every GitHub run in between.
-      const pagingRuns = results
-        .filter((_, index) => this.providers[index]?.fetchOlderRuns !== undefined)
-        .flatMap((result) => result.runs)
-      if (pagingRuns.length > 0) {
-        const oldest = pagingRuns.reduce((a, b) =>
-          new Date(b.createdAt).getTime() < new Date(a.createdAt).getTime() ? b : a,
-        )
-        this.oldestWorkflowTimestamp = oldest.createdAt
-      }
-
-      // A dismissed blocked run whose status has moved on is no longer dismissed.
-      for (const run of allRuns) {
-        const dismissedAs = this.dismissedBlocked.get(run.key)
-        if (dismissedAs !== undefined && dismissedAs !== run.status) {
-          this.dismissedBlocked.delete(run.key)
-        }
-      }
-
-      // Visible runs = active runs + finished ones pending confirmation, excluding dismissed
-      const visibleRuns = allRuns.filter((run) => this.isVisible(run))
-
-      // Jobs a provider handed over with its runs (Buildkite) are kept for
-      // every visible run, finished ones included — they cost nothing. Only
-      // active runs are worth a separate fetch.
-      const jobPromises = visibleRuns
-        .filter((run) => providerJobs.has(run.key) || isActive(run.status))
-        .map(async (run) => {
-          const embedded = providerJobs.get(run.key)
-          if (embedded) return { key: run.key, jobs: embedded }
-          const provider = this.providerFor(run)
-          const jobs = provider ? await provider.fetchJobs(run) : []
-          return { key: run.key, jobs }
-        })
-
-      const jobResults = await Promise.all(jobPromises)
-
-      // Update jobs map
-      this.jobs.clear()
-      jobResults.forEach(({ key, jobs }) => {
-        this.jobs.set(key, jobs)
+    const snapshotJobs = new Map<string, Job[]>(Object.entries(snapshot.jobs))
+    const diagnostics = [...snapshot.diagnostics]
+    if (this.buildkiteDisabled) {
+      diagnostics.push({
+        provider: "buildkite",
+        level: "info",
+        message: "Buildkite: disabled (--no-buildkite)",
       })
+    }
+    this.logChangedDiagnostics(diagnostics)
+    const allRuns = [...snapshot.runs].sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+    )
 
-      // A GitHub run that is still going but already has a failed job is
-      // doomed; say so. Buildkite reports this itself (the build's `failing`
-      // state, which the mapper already turned into isFailing) and that is
-      // authoritative: deriving it from jobs would flag skipped or
-      // soft-failed jobs as failures.
-      const workflows = visibleRuns.map((run) =>
-        run.provider === "github" ? applyIsFailing(run, this.jobs.get(run.key) ?? []) : run,
-      )
+    // Kept for the empty-state panel: a Buildkite misconfiguration on a
+    // checkout with no GitHub Actions runs must not look like idle CI.
+    this.lastDiagnostics = diagnostics
 
-      // Update dashboard - only pass PRs/Docker data when those features are enabled
-      this.dashboard.updateWorkflows(
-        workflows,
-        this.jobs,
-        this.showPRs ? this.pullRequests : undefined,
-        this.showDocker ? this.dockerServices : undefined,
-        this.lastDiagnostics,
+    // Update watched and completed trackers, keyed by Run.key: ids are only
+    // unique within a provider.
+    for (const run of allRuns) {
+      if (isActive(run.status)) {
+        this.watchedWorkflows.add(run.key)
+        // Running again (a GitHub rerun keeps its key): an earlier
+        // dismissal no longer applies.
+        this.dismissedRuns.delete(run.key)
+      } else if (
+        !this.completedWorkflows.has(run.key) &&
+        !this.dismissedRuns.has(run.key) &&
+        (this.watchedWorkflows.has(run.key) || this.finishedInWindow(run))
+      ) {
+        // Reached a verdict while being watched
+        this.completedWorkflows.set(run.key, run)
+      }
+    }
+
+    // Track the oldest timestamp for resurrect from GitHub runs only: only
+    // GitHub can page backwards, and an old Buildkite build in the merged
+    // list would otherwise make resurrect skip every GitHub run in between.
+    const githubRuns = allRuns.filter((run) => run.provider === "github")
+    if (githubRuns.length > 0) {
+      const oldest = githubRuns.reduce((a, b) =>
+        new Date(b.createdAt).getTime() < new Date(a.createdAt).getTime() ? b : a,
       )
+      this.oldestWorkflowTimestamp = oldest.createdAt
+    }
+
+    // A dismissed blocked run whose status has moved on is no longer dismissed.
+    for (const run of allRuns) {
+      const dismissedAs = this.dismissedBlocked.get(run.key)
+      if (dismissedAs !== undefined && dismissedAs !== run.status) {
+        this.dismissedBlocked.delete(run.key)
+      }
+    }
+
+    // Visible runs = active runs + finished ones pending confirmation, excluding dismissed
+    const visibleRuns = allRuns.filter((run) => this.isVisible(run))
+
+    // The jobs the poller sent, kept for every visible run.
+    this.jobs.clear()
+    for (const run of visibleRuns) {
+      const jobs = snapshotJobs.get(run.key)
+      if (jobs) this.jobs.set(run.key, jobs)
+    }
+
+    // A GitHub run that is still going but already has a failed job is
+    // doomed; say so. Buildkite reports this itself (the build's `failing`
+    // state, which the mapper already turned into isFailing) and that is
+    // authoritative: deriving it from jobs would flag skipped or
+    // soft-failed jobs as failures.
+    const workflows = visibleRuns.map((run) =>
+      run.provider === "github" ? applyIsFailing(run, this.jobs.get(run.key) ?? []) : run,
+    )
+
+    this.hasSnapshot = true
+    this.render(workflows)
+  }
+
+  /** Re-reads open pull requests and re-renders the grid with them. */
+  async pollPullRequests(): Promise<void> {
+    if (this.prPollInFlight) return
+    this.prPollInFlight = true
+    try {
+      this.pullRequests = await this.github.getAllPullRequests(this.repositories)
+      if (this.hasSnapshot) this.render(this.dashboard.getCurrentWorkflows())
     } catch (error) {
-      // Show error in dashboard
-      this.dashboard.log(`Error refreshing: ${error}`, "error")
-      this.dashboard.showError(`Failed to load workflows: ${error}`)
+      this.dashboard.log(`Failed to fetch pull requests: ${error}`, "error")
     } finally {
-      this.isRefreshing = false
-      // Stop the refresh animation
-      this.dashboard.stopRefreshAnimation()
+      this.prPollInFlight = false
     }
   }
 
-  /** Logs each diagnostic the previous refresh did not also produce. */
+  /** Re-reads Docker Compose status and re-renders the grid with it. */
+  async pollDocker(): Promise<void> {
+    if (this.dockerPollInFlight) return
+    this.dockerPollInFlight = true
+    try {
+      this.dashboard.log(
+        `Checking Docker services for repositories: ${this.repositories.join(", ")}`,
+        "debug",
+      )
+      this.dockerServices = await this.dockerService.getAllDockerStatus(this.repositories, (msg) =>
+        this.dashboard.log(msg, "debug"),
+      )
+      const totalServices = this.dockerServices.reduce((acc, ds) => acc + ds.services.length, 0)
+      const logLevel = this.dockerServices.length > 0 ? "info" : "debug"
+      this.dashboard.log(
+        `Found ${this.dockerServices.length} compose files, ${totalServices} total services`,
+        logLevel,
+      )
+
+      // Log which repos have Docker services
+      if (this.dockerServices.length > 0) {
+        const reposWithDocker = [...new Set(this.dockerServices.map((ds) => ds.repository))]
+        this.dashboard.log(`Docker services found in: ${reposWithDocker.join(", ")}`, "debug")
+      }
+      if (this.hasSnapshot) this.render(this.dashboard.getCurrentWorkflows())
+    } catch (error) {
+      this.dashboard.log(`Failed to check Docker services: ${error}`, "error")
+    } finally {
+      this.dockerPollInFlight = false
+    }
+  }
+
+  /** Draws these runs with the current jobs, PRs, Docker status and diagnostics. */
+  private render(workflows: Run[]): void {
+    // Only pass PRs/Docker data when those features are enabled
+    this.dashboard.updateWorkflows(
+      workflows,
+      this.jobs,
+      this.showPRs ? this.pullRequests : undefined,
+      this.showDocker ? this.dockerServices : undefined,
+      this.lastDiagnostics,
+    )
+  }
+
+  /** Logs each diagnostic the previous snapshot did not also carry. */
   private logChangedDiagnostics(diagnostics: ProviderDiagnostic[]): void {
     const current = new Set<string>()
     for (const diagnostic of diagnostics) {
@@ -687,21 +726,6 @@ export class App {
       }
     }
     this.previousDiagnosticMessages = current
-  }
-
-  private startAutoRefresh(): void {
-    const interval = this.configManager.refreshInterval
-    this.refreshInterval = setInterval(() => {
-      // Auto-refresh (don't call through manual refresh handler)
-      this.performRefresh(false)
-    }, interval)
-  }
-
-  private stopAutoRefresh(): void {
-    if (this.refreshInterval) {
-      clearInterval(this.refreshInterval)
-      this.refreshInterval = undefined
-    }
   }
 
   /**
@@ -756,13 +780,7 @@ export class App {
     const filteredWorkflows = currentWorkflows.filter((run) => this.isVisible(run))
 
     // Update dashboard with filtered workflows immediately
-    this.dashboard.updateWorkflows(
-      filteredWorkflows,
-      this.jobs,
-      this.showPRs ? this.pullRequests : undefined,
-      this.showDocker ? this.dockerServices : undefined,
-      this.lastDiagnostics,
-    )
+    this.render(filteredWorkflows)
   }
 
   async resurrectOldestRun(): Promise<void> {
@@ -782,20 +800,16 @@ export class App {
         "info",
       )
 
-      // Fetch one run older than our oldest timestamp from every provider that
-      // can page backwards; those that cannot sit resurrect out.
-      const scope = this.currentScope()
-      const before = this.oldestWorkflowTimestamp
-      const olderWorkflows: Run[] = []
-      for (const provider of this.providers) {
-        if (!provider.fetchOlderRuns) continue
-        const result = await provider.fetchOlderRuns(scope, before, 1)
-        olderWorkflows.push(...result.runs)
-        for (const diagnostic of result.diagnostics) {
-          this.dashboard.log(diagnostic.message, diagnostic.level === "error" ? "error" : "info")
-        }
+      // One run older than our oldest GitHub run; the poller pages GitHub only.
+      const result = await this.pollerClient?.older(
+        this.repositories,
+        this.oldestWorkflowTimestamp,
+        1,
+      )
+      for (const diagnostic of result?.diagnostics ?? []) {
+        this.dashboard.log(diagnostic.message, diagnostic.level === "error" ? "error" : "info")
       }
-      olderWorkflows.sort(
+      const olderWorkflows = [...(result?.runs ?? [])].sort(
         (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
       )
 
@@ -818,13 +832,7 @@ export class App {
       const allWorkflows = [...currentWorkflows, resurrectedWorkflow]
 
       // Update the dashboard
-      this.dashboard.updateWorkflows(
-        allWorkflows,
-        this.jobs,
-        this.showPRs ? this.pullRequests : undefined,
-        this.showDocker ? this.dockerServices : undefined,
-        this.lastDiagnostics,
-      )
+      this.render(allWorkflows)
 
       this.dashboard.log(
         `Resurrected workflow: ${resurrectedWorkflow.title || resurrectedWorkflow.pipeline}`,
@@ -839,7 +847,11 @@ export class App {
   }
 
   stop(): void {
-    this.stopAutoRefresh()
+    clearInterval(this.prTimer)
+    clearInterval(this.dockerTimer)
+    this.prTimer = undefined
+    this.dockerTimer = undefined
+    this.pollerClient?.close()
     this.dashboard.destroy()
   }
 }

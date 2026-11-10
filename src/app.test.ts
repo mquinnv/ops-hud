@@ -2,14 +2,23 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 import { mkdtempSync, writeFileSync } from "fs"
 import { tmpdir } from "os"
 import { join } from "path"
-import { App } from "./app.js"
+import { App, PR_REFRESH_MS } from "./app.js"
 import { ConfigManager } from "./config.js"
 import type { Dashboard } from "./dashboard.js"
+import type { PollerClient, PollerStatus } from "./poller/client.js"
+import type { Budget, Snapshot, Subscription } from "./poller/protocol.js"
 import { BuildkiteProvider, type BuildkiteProviderOptions } from "./providers/buildkite.js"
 import type { GitHubProvider } from "./providers/github.js"
-import type { CiProvider, FetchResult, ProviderDiagnostic, Scope } from "./providers/types.js"
+import type {
+  CiProvider,
+  CiReader,
+  FetchResult,
+  ProviderDiagnostic,
+  Scope,
+} from "./providers/types.js"
 import type { RunStatus } from "./status.js"
-import type { BuildkiteConfig, Job, Provider, Run } from "./types.js"
+import { isActive } from "./status.js"
+import type { BuildkiteConfig, Job, Provider, PullRequest, Run } from "./types.js"
 
 // ---------------------------------------------------------------------------
 // Doubles. Everything the App reaches for is injected, so nothing here touches
@@ -44,10 +53,10 @@ function makeJob(runKey: string, status: RunStatus, id = "j1"): Job {
   return { id, key: `${runKey}:${id}`, runKey, name: `job ${id}`, status }
 }
 
-class FakeProvider implements CiProvider {
+class FakeProvider implements CiProvider, CiReader {
   fetchRunsCalls = 0
   fetchJobsFor: string[] = []
-  olderResult: FetchResult = { runs: [], diagnostics: [] }
+  cancelled: string[] = []
 
   constructor(
     readonly name: string,
@@ -75,23 +84,105 @@ class FakeProvider implements CiProvider {
     return this.jobs.get(run.key) ?? []
   }
 
-  async cancel(): Promise<void> {}
+  async cancel(run: Run): Promise<void> {
+    this.cancelled.push(run.key)
+  }
   async rerun(): Promise<void> {}
   async logs(): Promise<string> {
     return ""
   }
 }
 
-/** A provider that can page backwards, for the resurrect path. */
-class PagingProvider extends FakeProvider {
-  async fetchOlderRuns(): Promise<FetchResult> {
+/**
+ * Stands in for the shared poller: records what the pane asks of it and lets
+ * a test push snapshots, budgets and status changes at the App.
+ */
+class FakePollerClient implements PollerClient {
+  calls: string[] = []
+  watches: Subscription[] = []
+  refreshes: Array<string[] | undefined> = []
+  olders: Array<{ repositories: string[]; before: string; limit: number }> = []
+  olderResult: FetchResult = { runs: [], diagnostics: [] }
+  closed = false
+  private snapshotCbs: Array<(snapshot: Snapshot) => void> = []
+  private budgetCbs: Array<(budget: Budget) => void> = []
+  private statusCbs: Array<(status: PollerStatus) => void> = []
+
+  async start(): Promise<void> {
+    this.calls.push("start")
+  }
+  watch(subscription: Subscription): void {
+    this.calls.push("watch")
+    this.watches.push(subscription)
+  }
+  refresh(repositories?: string[]): void {
+    this.refreshes.push(repositories)
+  }
+  async older(repositories: string[], before: string, limit: number): Promise<FetchResult> {
+    this.olders.push({ repositories, before, limit })
     return this.olderResult
   }
+  onSnapshot(cb: (snapshot: Snapshot) => void): void {
+    this.snapshotCbs.push(cb)
+  }
+  onBudget(cb: (budget: Budget) => void): void {
+    this.budgetCbs.push(cb)
+  }
+  onStatus(cb: (status: PollerStatus) => void): void {
+    this.statusCbs.push(cb)
+  }
+  close(): void {
+    this.closed = true
+  }
+
+  emitSnapshot(snapshot: Snapshot): void {
+    for (const cb of this.snapshotCbs) cb(snapshot)
+  }
+  emitBudget(budget: Budget): void {
+    for (const cb of this.budgetCbs) cb(budget)
+  }
+  emitStatus(status: PollerStatus): void {
+    for (const cb of this.statusCbs) cb(status)
+  }
 }
+
+/**
+ * What the poller would send for these providers: their runs, the jobs they
+ * embedded, and a jobs fetch for each active run that came without any.
+ */
+async function snapshotFrom(
+  providers: Array<CiProvider & CiReader>,
+  repositories: string[],
+): Promise<Snapshot> {
+  const scope: Scope = { repositories }
+  const results = await Promise.all(providers.map((provider) => provider.fetchRuns(scope)))
+  const runs: Run[] = []
+  const jobs: Record<string, Job[]> = {}
+  const diagnostics: ProviderDiagnostic[] = []
+  for (const [index, result] of results.entries()) {
+    runs.push(...result.runs)
+    diagnostics.push(...result.diagnostics)
+    for (const [key, embedded] of result.jobs ?? []) jobs[key] = embedded
+    for (const run of result.runs) {
+      if (jobs[run.key] === undefined && isActive(run.status)) {
+        jobs[run.key] = await providers[index].fetchJobs(run)
+      }
+    }
+  }
+  return { repositories, runs, jobs, diagnostics }
+}
+
+const emptySnapshot = (repositories: string[] = ["acme/widgets"]): Snapshot => ({
+  repositories,
+  runs: [],
+  jobs: {},
+  diagnostics: [],
+})
 
 /** The action callbacks App.setupEventHandlers() registers on the dashboard,
  *  captured so tests can fire them directly without a real terminal. */
 interface CapturedHandlers {
+  refresh?: () => void
   kill?: (run: Run) => void | Promise<void>
   rerun?: (run: Run) => void | Promise<void>
   logs?: (run: Run) => void | Promise<void>
@@ -102,14 +193,26 @@ function makeDashboard() {
     runs: Run[]
     jobs: Map<string, Job[]>
     diagnostics?: ProviderDiagnostic[]
+    prs?: PullRequest[]
   }> = []
   const logs: string[] = []
   const handlers: CapturedHandlers = {}
+  const budgets: Array<Budget | undefined> = []
+  const statuses: PollerStatus[] = []
+  const loading = { count: 0 }
 
   const dashboard = {
     isModalOpen: () => false,
-    showLoadingInStatus() {},
+    showLoadingInStatus() {
+      loading.count++
+    },
     stopRefreshAnimation() {},
+    setBudget(budget: Budget | undefined) {
+      budgets.push(budget)
+    },
+    setPollerStatus(status: PollerStatus) {
+      statuses.push(status)
+    },
     showError() {},
     log(message: string) {
       logs.push(message)
@@ -117,11 +220,11 @@ function makeDashboard() {
     updateWorkflows(
       runs: Run[],
       jobs: Map<string, Job[]>,
-      _prs?: unknown,
+      prs?: PullRequest[],
       _docker?: unknown,
       diagnostics?: ProviderDiagnostic[],
     ) {
-      rendered.push({ runs, jobs, diagnostics })
+      rendered.push({ runs, jobs, diagnostics, prs })
     },
     getCurrentWorkflows(): Run[] {
       return rendered.at(-1)?.runs ?? []
@@ -129,9 +232,11 @@ function makeDashboard() {
     destroy() {},
     // No-op event registrations — App.initialize() wires all of these up via
     // setupEventHandlers(), but nothing in these tests fires a dashboard event,
-    // except onKillRun/onRunRerun/onRunLogs, whose callbacks are captured
-    // above for the provider-wording tests to invoke directly.
-    onRefresh() {},
+    // except onRefresh/onKillRun/onRunRerun/onRunLogs, whose callbacks are
+    // captured for the tests to invoke directly.
+    onRefresh(cb: () => void) {
+      handlers.refresh = cb
+    },
     onExit() {},
     onOpenRun() {},
     onOpenPR() {},
@@ -153,7 +258,15 @@ function makeDashboard() {
     },
   }
 
-  return { dashboard: dashboard as unknown as Dashboard, rendered, logs, handlers }
+  return {
+    dashboard: dashboard as unknown as Dashboard,
+    rendered,
+    logs,
+    handlers,
+    budgets,
+    statuses,
+    loading,
+  }
 }
 
 interface AppInternals {
@@ -162,7 +275,6 @@ interface AppInternals {
   oldestWorkflowTimestamp?: string
   watchedWorkflows: Set<string>
   completedWorkflows: Map<string, Run>
-  performRefresh(isManual?: boolean): Promise<void>
   dismissRun(key: string, status?: RunStatus): void
   dismissAllCompletedRuns(runs: Run[]): void
   setupEventHandlers(): void
@@ -177,16 +289,19 @@ interface AppInternals {
 // History on launch (showCompletedFor) is off unless a test asks for it, so
 // each test states the visibility window it depends on.
 function makeApp(
-  providers: CiProvider[],
+  providers: Array<CiProvider & CiReader>,
   opts: { now?: () => number; historyMinutes?: number } = {},
 ) {
-  const { dashboard, rendered, logs, handlers } = makeDashboard()
+  const { dashboard, rendered, logs, handlers, loading } = makeDashboard()
   const configManager = new ConfigManager()
   configManager.updateFromArgs({ showCompletedFor: opts.historyMinutes ?? 0 })
-  const app = new App({ providers, dashboard, configManager, now: opts.now })
+  const client = new FakePollerClient()
+  const app = new App({ providers, dashboard, configManager, now: opts.now, pollerClient: client })
   const internals = app as unknown as AppInternals
   internals.repositories = ["acme/widgets"]
-  return { app, internals, rendered, logs, handlers }
+  /** One poll: what the poller would send for these providers, applied. */
+  const refresh = async () => app.applySnapshot(await snapshotFrom(providers, ["acme/widgets"]))
+  return { app, internals, rendered, logs, handlers, client, refresh, loading }
 }
 
 /** A raw Buildkite build payload, for tests that drive the real provider. */
@@ -225,12 +340,12 @@ const visibleKeys = (rendered: Array<{ runs: Run[] }>): string[] =>
 
 // ---------------------------------------------------------------------------
 
-describe("performRefresh visibility", () => {
+describe("snapshot visibility", () => {
   test("an in-flight run is shown and watched", async () => {
     const run = makeRun({ status: "running" })
-    const { internals, rendered } = makeApp([new FakeProvider("github", [run])])
+    const { internals, refresh, rendered } = makeApp([new FakeProvider("github", [run])])
 
-    await internals.performRefresh()
+    await refresh()
 
     expect(visibleKeys(rendered)).toEqual([run.key])
     expect(internals.watchedWorkflows.has(run.key)).toBe(true)
@@ -239,11 +354,11 @@ describe("performRefresh visibility", () => {
 
   test("a finished run from before ops-hud started stays off the grid", async () => {
     const run = makeRun({ status: "passed" })
-    const { internals, rendered } = makeApp([new FakeProvider("github", [run])], {
+    const { internals, refresh, rendered } = makeApp([new FakeProvider("github", [run])], {
       now: () => Date.parse("2026-09-17T11:00:00Z"),
     })
 
-    await internals.performRefresh()
+    await refresh()
 
     expect(visibleKeys(rendered)).toEqual([])
     expect(internals.watchedWorkflows.has(run.key)).toBe(false)
@@ -259,24 +374,24 @@ describe("performRefresh visibility", () => {
 
     test("a run that finished inside the window before launch is shown", async () => {
       const run = finished("2026-09-17T09:10:00Z", "2026-09-17T09:20:00Z")
-      const { internals, rendered } = makeApp([new FakeProvider("github", [run])], {
+      const { refresh, rendered } = makeApp([new FakeProvider("github", [run])], {
         now: start,
         historyMinutes: 60,
       })
 
-      await internals.performRefresh()
+      await refresh()
 
       expect(visibleKeys(rendered)).toEqual([run.key])
     })
 
     test("one that finished before the window is not", async () => {
       const run = finished("2026-09-17T08:40:00Z", "2026-09-17T08:50:00Z")
-      const { internals, rendered } = makeApp([new FakeProvider("github", [run])], {
+      const { refresh, rendered } = makeApp([new FakeProvider("github", [run])], {
         now: start,
         historyMinutes: 60,
       })
 
-      await internals.performRefresh()
+      await refresh()
 
       expect(visibleKeys(rendered)).toEqual([])
     })
@@ -285,24 +400,24 @@ describe("performRefresh visibility", () => {
     // recently in every sense that matters: judge by when it finished.
     test("finishing time wins over creation time", async () => {
       const run = finished("2026-09-17T08:00:00Z", "2026-09-17T09:30:00Z")
-      const { internals, rendered } = makeApp([new FakeProvider("github", [run])], {
+      const { refresh, rendered } = makeApp([new FakeProvider("github", [run])], {
         now: start,
         historyMinutes: 60,
       })
 
-      await internals.performRefresh()
+      await refresh()
 
       expect(visibleKeys(rendered)).toEqual([run.key])
     })
 
     test("a window of 0 turns history off", async () => {
       const run = finished("2026-09-17T09:40:00Z", "2026-09-17T09:50:00Z")
-      const { internals, rendered } = makeApp([new FakeProvider("github", [run])], {
+      const { refresh, rendered } = makeApp([new FakeProvider("github", [run])], {
         now: start,
         historyMinutes: 0,
       })
 
-      await internals.performRefresh()
+      await refresh()
 
       expect(visibleKeys(rendered)).toEqual([])
     })
@@ -311,11 +426,11 @@ describe("performRefresh visibility", () => {
   test("a run that finishes while watched stays up until it is dismissed", async () => {
     const running = makeRun({ status: "running" })
     const provider = new FakeProvider("github", [running])
-    const { internals, rendered } = makeApp([provider])
+    const { internals, refresh, rendered } = makeApp([provider])
 
-    await internals.performRefresh()
+    await refresh()
     provider.setRuns([{ ...running, status: "passed" }])
-    await internals.performRefresh()
+    await refresh()
 
     expect(visibleKeys(rendered)).toEqual([running.key])
     expect(internals.completedWorkflows.has(running.key)).toBe(true)
@@ -325,9 +440,9 @@ describe("performRefresh visibility", () => {
   test("identity is the composite key, not the native id", async () => {
     const mine = makeRun({ provider: "github", id: "7", status: "running" })
     const theirs = makeRun({ provider: "buildkite", id: "7", status: "passed" })
-    const { internals, rendered } = makeApp([new FakeProvider("github", [mine, theirs])])
+    const { internals, refresh, rendered } = makeApp([new FakeProvider("github", [mine, theirs])])
 
-    await internals.performRefresh()
+    await refresh()
 
     expect(visibleKeys(rendered)).toEqual([mine.key])
     expect([...internals.watchedWorkflows]).toEqual(["github:acme/widgets:7"])
@@ -346,11 +461,11 @@ describe("dismissal", () => {
 
     test("a run that started and finished between two refreshes is still shown", async () => {
       const run = finishedAt("2026-09-17T10:05:00Z")
-      const { internals, rendered } = makeApp([new FakeProvider("buildkite", [run])], {
+      const { internals, refresh, rendered } = makeApp([new FakeProvider("buildkite", [run])], {
         now: start,
       })
 
-      await internals.performRefresh()
+      await refresh()
 
       expect(visibleKeys(rendered)).toEqual([run.key])
       expect(internals.completedWorkflows.has(run.key)).toBe(true)
@@ -358,35 +473,35 @@ describe("dismissal", () => {
 
     test("a run created just before startup still counts, to absorb clock skew", async () => {
       const run = finishedAt("2026-09-17T09:59:40Z")
-      const { internals, rendered } = makeApp([new FakeProvider("buildkite", [run])], {
+      const { refresh, rendered } = makeApp([new FakeProvider("buildkite", [run])], {
         now: start,
       })
 
-      await internals.performRefresh()
+      await refresh()
 
       expect(visibleKeys(rendered)).toEqual([run.key])
     })
 
     test("a run created well before startup does not", async () => {
       const run = finishedAt("2026-09-17T09:59:00Z")
-      const { internals, rendered } = makeApp([new FakeProvider("buildkite", [run])], {
+      const { refresh, rendered } = makeApp([new FakeProvider("buildkite", [run])], {
         now: start,
       })
 
-      await internals.performRefresh()
+      await refresh()
 
       expect(visibleKeys(rendered)).toEqual([])
     })
 
     test("dismissing one keeps it dismissed across refreshes", async () => {
       const run = finishedAt("2026-09-17T10:05:00Z")
-      const { internals, rendered } = makeApp([new FakeProvider("buildkite", [run])], {
+      const { internals, refresh, rendered } = makeApp([new FakeProvider("buildkite", [run])], {
         now: start,
       })
 
-      await internals.performRefresh()
+      await refresh()
       internals.dismissRun(run.key)
-      await internals.performRefresh()
+      await refresh()
 
       expect(visibleKeys(rendered)).toEqual([])
     })
@@ -394,13 +509,13 @@ describe("dismissal", () => {
     test("dismiss-all keeps them dismissed across refreshes", async () => {
       const a = finishedAt("2026-09-17T10:05:00Z")
       const b = makeRun({ status: "passed", createdAt: "2026-09-17T10:06:00Z", id: "b" })
-      const { internals, rendered } = makeApp([new FakeProvider("buildkite", [a, b])], {
+      const { internals, refresh, rendered } = makeApp([new FakeProvider("buildkite", [a, b])], {
         now: start,
       })
 
-      await internals.performRefresh()
+      await refresh()
       internals.dismissAllCompletedRuns([a, b])
-      await internals.performRefresh()
+      await refresh()
 
       expect(visibleKeys(rendered)).toEqual([])
     })
@@ -410,16 +525,16 @@ describe("dismissal", () => {
     test("a dismissed run that is re-run comes back and stays up when it finishes", async () => {
       const run = finishedAt("2026-09-17T10:05:00Z")
       const provider = new FakeProvider("github", [run])
-      const { internals, rendered } = makeApp([provider], { now: start })
+      const { internals, refresh, rendered } = makeApp([provider], { now: start })
 
-      await internals.performRefresh()
+      await refresh()
       internals.dismissRun(run.key)
       provider.setRuns([{ ...run, status: "running" }])
-      await internals.performRefresh()
+      await refresh()
       expect(visibleKeys(rendered)).toEqual([run.key])
 
       provider.setRuns([{ ...run, status: "failed" }])
-      await internals.performRefresh()
+      await refresh()
       expect(visibleKeys(rendered)).toEqual([run.key])
     })
   })
@@ -427,11 +542,11 @@ describe("dismissal", () => {
   test("dismissing a run drops it from both trackers and from the grid", async () => {
     const running = makeRun({ status: "running" })
     const provider = new FakeProvider("github", [running])
-    const { internals, rendered } = makeApp([provider])
+    const { internals, refresh, rendered } = makeApp([provider])
 
-    await internals.performRefresh()
+    await refresh()
     provider.setRuns([{ ...running, status: "passed" }])
-    await internals.performRefresh()
+    await refresh()
 
     internals.dismissRun(running.key)
 
@@ -445,35 +560,35 @@ describe("dismissal", () => {
   test("dismissing a blocked run hides it while it stays blocked", async () => {
     const blocked = makeRun({ provider: "buildkite", status: "blocked" })
     const provider = new FakeProvider("buildkite", [blocked])
-    const { internals, rendered } = makeApp([provider])
+    const { internals, refresh, rendered } = makeApp([provider])
 
-    await internals.performRefresh()
+    await refresh()
     expect(visibleKeys(rendered)).toEqual([blocked.key])
 
     internals.dismissRun(blocked.key, "blocked")
     expect(visibleKeys(rendered)).toEqual([])
 
-    await internals.performRefresh()
+    await refresh()
     expect(visibleKeys(rendered)).toEqual([])
   })
 
   test("a dismissed blocked run comes back once its status changes", async () => {
     const blocked = makeRun({ provider: "buildkite", status: "blocked" })
     const provider = new FakeProvider("buildkite", [blocked])
-    const { internals, rendered } = makeApp([provider])
+    const { internals, refresh, rendered } = makeApp([provider])
 
-    await internals.performRefresh()
+    await refresh()
     internals.dismissRun(blocked.key, "blocked")
-    await internals.performRefresh()
+    await refresh()
     expect(visibleKeys(rendered)).toEqual([])
 
     provider.setRuns([{ ...blocked, status: "running" }])
-    await internals.performRefresh()
+    await refresh()
     expect(visibleKeys(rendered)).toEqual([blocked.key])
 
     // ...and blocking again does not re-hide it: the dismissal was spent.
     provider.setRuns([blocked])
-    await internals.performRefresh()
+    await refresh()
     expect(visibleKeys(rendered)).toEqual([blocked.key])
   })
 
@@ -481,11 +596,11 @@ describe("dismissal", () => {
     const finished = makeRun({ id: "1", status: "running" })
     const active = makeRun({ id: "2", status: "running" })
     const provider = new FakeProvider("github", [finished, active])
-    const { internals, rendered } = makeApp([provider])
+    const { internals, refresh, rendered } = makeApp([provider])
 
-    await internals.performRefresh()
+    await refresh()
     provider.setRuns([{ ...finished, status: "failed" }, active])
-    await internals.performRefresh()
+    await refresh()
 
     const terminal = (rendered.at(-1)?.runs ?? []).filter((run) => run.status === "failed")
     internals.dismissAllCompletedRuns(terminal)
@@ -502,9 +617,9 @@ describe("isFailing", () => {
     const jobs = new Map([
       [run.key, [makeJob(run.key, "passed", "a"), makeJob(run.key, "failed", "b")]],
     ])
-    const { internals, rendered } = makeApp([new FakeProvider("github", [run], jobs)])
+    const { refresh, rendered } = makeApp([new FakeProvider("github", [run], jobs)])
 
-    await internals.performRefresh()
+    await refresh()
 
     expect(rendered.at(-1)?.runs[0].isFailing).toBe(true)
   })
@@ -514,9 +629,9 @@ describe("isFailing", () => {
     const jobs = new Map([
       [run.key, [makeJob(run.key, "passed", "a"), makeJob(run.key, "running", "b")]],
     ])
-    const { internals, rendered } = makeApp([new FakeProvider("github", [run], jobs)])
+    const { refresh, rendered } = makeApp([new FakeProvider("github", [run], jobs)])
 
-    await internals.performRefresh()
+    await refresh()
 
     expect(rendered.at(-1)?.runs[0].isFailing).toBe(false)
   })
@@ -538,9 +653,9 @@ describe("isFailing", () => {
           ]),
         ),
     })
-    const { internals, rendered } = makeApp([provider])
+    const { refresh, rendered } = makeApp([provider])
 
-    await internals.performRefresh()
+    await refresh()
 
     const run = rendered.at(-1)?.runs[0]
     expect(run?.isFailing).toBe(false)
@@ -548,7 +663,7 @@ describe("isFailing", () => {
     expect(jobs.find((j) => j.id === "b")?.status).toBe("skipped")
   })
 
-  test("a failing Buildkite build keeps isFailing through performRefresh", async () => {
+  test("a failing Buildkite build keeps isFailing through a snapshot", async () => {
     const provider = new BuildkiteProvider({
       token: "t",
       org: "acme",
@@ -560,9 +675,9 @@ describe("isFailing", () => {
           ]),
         ),
     })
-    const { internals, rendered } = makeApp([provider])
+    const { refresh, rendered } = makeApp([provider])
 
-    await internals.performRefresh()
+    await refresh()
 
     expect(rendered.at(-1)?.runs[0].isFailing).toBe(true)
   })
@@ -571,11 +686,11 @@ describe("isFailing", () => {
     const run = makeRun({ status: "running" })
     const jobs = new Map([[run.key, [makeJob(run.key, "failed", "a")]]])
     const provider = new FakeProvider("github", [run], jobs)
-    const { internals, rendered } = makeApp([provider])
+    const { refresh, rendered } = makeApp([provider])
 
-    await internals.performRefresh()
+    await refresh()
     provider.setRuns([{ ...run, status: "failed" }])
-    await internals.performRefresh()
+    await refresh()
 
     expect(rendered.at(-1)?.runs[0].status).toBe("failed")
     expect(rendered.at(-1)?.runs[0].isFailing).toBe(false)
@@ -586,12 +701,12 @@ describe("multiple providers", () => {
   test("runs from every provider merge into one list, newest first", async () => {
     const older = makeRun({ provider: "github", id: "1", createdAt: "2026-09-17T09:00:00Z" })
     const newer = makeRun({ provider: "buildkite", id: "2", createdAt: "2026-09-17T11:00:00Z" })
-    const { internals, rendered } = makeApp([
+    const { refresh, rendered } = makeApp([
       new FakeProvider("github", [older]),
       new FakeProvider("buildkite", [newer]),
     ])
 
-    await internals.performRefresh()
+    await refresh()
 
     expect(visibleKeys(rendered)).toEqual([newer.key, older.key])
   })
@@ -600,9 +715,9 @@ describe("multiple providers", () => {
     const run = makeRun({ provider: "buildkite", status: "running" })
     const jobs = new Map([[run.key, [makeJob(run.key, "running")]]])
     const provider = new FakeProvider("buildkite", [run], jobs, true)
-    const { internals, rendered } = makeApp([provider])
+    const { refresh, rendered } = makeApp([provider])
 
-    await internals.performRefresh()
+    await refresh()
 
     expect(provider.fetchJobsFor).toEqual([])
     expect(rendered.at(-1)?.jobs.get(run.key)).toHaveLength(1)
@@ -614,11 +729,11 @@ describe("multiple providers", () => {
     const run = makeRun({ provider: "buildkite", status: "running" })
     const jobs = new Map([[run.key, [makeJob(run.key, "passed")]]])
     const provider = new FakeProvider("buildkite", [run], jobs, true)
-    const { internals, rendered } = makeApp([provider])
+    const { refresh, rendered } = makeApp([provider])
 
-    await internals.performRefresh()
+    await refresh()
     provider.setRuns([{ ...run, status: "passed" }])
-    await internals.performRefresh()
+    await refresh()
 
     expect(visibleKeys(rendered)).toEqual([run.key])
     expect(rendered.at(-1)?.jobs.get(run.key)).toHaveLength(1)
@@ -648,11 +763,11 @@ describe("multiple providers", () => {
       message: "Buildkite: skipped",
     }
     const provider = new FakeProvider("buildkite", [], new Map(), false, [diagnostic])
-    const { internals, logs } = makeApp([provider])
+    const { refresh, logs } = makeApp([provider])
 
-    await internals.performRefresh()
-    await internals.performRefresh()
-    await internals.performRefresh()
+    await refresh()
+    await refresh()
+    await refresh()
 
     expect(logs.filter((line) => line === "Buildkite: skipped")).toHaveLength(1)
   })
@@ -662,12 +777,12 @@ describe("multiple providers", () => {
       { provider: "buildkite", level: "error", message: "Buildkite: HTTP 500" },
     ]
     const provider = new FakeProvider("buildkite", [], new Map(), false, diagnostics)
-    const { internals, logs } = makeApp([provider])
+    const { refresh, logs } = makeApp([provider])
 
-    await internals.performRefresh()
+    await refresh()
     diagnostics[0] = { provider: "buildkite", level: "error", message: "Buildkite: HTTP 502" }
-    await internals.performRefresh()
-    await internals.performRefresh()
+    await refresh()
+    await refresh()
 
     expect(logs.filter((line) => line.startsWith("Buildkite: HTTP"))).toEqual([
       "Buildkite: HTTP 500",
@@ -680,13 +795,13 @@ describe("multiple providers", () => {
       { provider: "buildkite", level: "error", message: "Buildkite: HTTP 500" },
     ]
     const provider = new FakeProvider("buildkite", [], new Map(), false, diagnostics)
-    const { internals, logs } = makeApp([provider])
+    const { refresh, logs } = makeApp([provider])
 
-    await internals.performRefresh()
+    await refresh()
     diagnostics.pop()
-    await internals.performRefresh()
+    await refresh()
     diagnostics.push({ provider: "buildkite", level: "error", message: "Buildkite: HTTP 500" })
-    await internals.performRefresh()
+    await refresh()
 
     expect(logs.filter((line) => line === "Buildkite: HTTP 500")).toHaveLength(2)
   })
@@ -695,9 +810,9 @@ describe("multiple providers", () => {
     const provider = new FakeProvider("github", [], new Map(), false, [
       { provider: "github", level: "error", message: "GitHub: API rate limit exceeded" },
     ])
-    const { internals, logs } = makeApp([provider])
+    const { refresh, logs } = makeApp([provider])
 
-    await internals.performRefresh()
+    await refresh()
 
     expect(logs).toContain("GitHub: API rate limit exceeded")
   })
@@ -759,59 +874,122 @@ describe("provider-accurate action wording", () => {
 
 describe("resurrect", () => {
   test("a rate-limited resurrect says so instead of claiming there is nothing older", async () => {
-    const provider = new PagingProvider("github", [makeRun({ status: "running" })])
-    provider.olderResult = {
+    const provider = new FakeProvider("github", [makeRun({ status: "running" })])
+    const { app, logs, client, refresh } = makeApp([provider])
+    client.olderResult = {
       runs: [],
       diagnostics: [
         { provider: "github", level: "error", message: "GitHub: API rate limit exceeded" },
       ],
     }
-    const { app, internals, logs } = makeApp([provider])
 
-    await internals.performRefresh()
+    await refresh()
     await app.resurrectOldestRun()
 
     expect(logs).toContain("GitHub: API rate limit exceeded")
   })
 
-  test("a provider that cannot page backwards simply sits it out", async () => {
-    const paging = new PagingProvider("github", [makeRun({ status: "running" })])
-    const other = new FakeProvider("buildkite", [makeRun({ provider: "buildkite", id: "9" })])
-    const { app, internals, logs } = makeApp([paging, other])
+  // Only GitHub can page backwards: Buildkite runs never set the cursor, so
+  // with nothing but Buildkite on the grid the poller is not asked at all.
+  test("Buildkite runs alone give resurrect no cursor and ask the poller nothing", async () => {
+    const buildkite = new FakeProvider("buildkite", [
+      makeRun({ provider: "buildkite", id: "9", status: "running" }),
+    ])
+    const { app, internals, logs, client, refresh } = makeApp([buildkite])
 
-    await internals.performRefresh()
+    await refresh()
     await app.resurrectOldestRun()
 
-    expect(logs).toContain("No older workflows found")
+    expect(internals.oldestWorkflowTimestamp).toBeUndefined()
+    expect(client.olders).toEqual([])
+    expect(logs).toContain("No older workflows available to resurrect")
   })
 
   // M5: an old Buildkite build in the merged list must not set the cursor
   // GitHub is asked to page back from, or every GitHub run in between is skipped.
-  test("the resurrect cursor comes only from providers that can page backwards", async () => {
-    const github = new PagingProvider("github", [
+  test("resurrect asks the poller for runs older than the oldest GitHub run", async () => {
+    const github = new FakeProvider("github", [
       makeRun({ id: "1", createdAt: "2026-09-17T10:00:00Z" }),
+      makeRun({ id: "3", createdAt: "2026-09-17T12:00:00Z" }),
     ])
     const buildkite = new FakeProvider("buildkite", [
       makeRun({ provider: "buildkite", id: "2", createdAt: "2020-01-01T00:00:00Z" }),
     ])
-    const { internals } = makeApp([github, buildkite])
+    const { app, internals, client, refresh } = makeApp([github, buildkite])
 
-    await internals.performRefresh()
+    await refresh()
+    await app.resurrectOldestRun()
 
     expect(internals.oldestWorkflowTimestamp).toBe("2026-09-17T10:00:00Z")
+    expect(client.olders).toEqual([
+      { repositories: ["acme/widgets"], before: "2026-09-17T10:00:00Z", limit: 1 },
+    ])
   })
 
   test("an older run comes back as a finished, dismissible card", async () => {
-    const provider = new PagingProvider("github", [makeRun({ id: "2", status: "running" })])
+    const provider = new FakeProvider("github", [makeRun({ id: "2", status: "running" })])
     const old = makeRun({ id: "1", status: "passed", createdAt: "2026-09-16T10:00:00Z" })
-    provider.olderResult = { runs: [old], diagnostics: [] }
-    const { app, internals, rendered } = makeApp([provider])
+    const { app, internals, rendered, client, refresh } = makeApp([provider])
+    client.olderResult = { runs: [old], diagnostics: [] }
 
-    await internals.performRefresh()
+    await refresh()
     await app.resurrectOldestRun()
 
     expect(visibleKeys(rendered)).toContain(old.key)
     expect(internals.completedWorkflows.has(old.key)).toBe(true)
+    // ...and the next resurrect pages back from it.
+    expect(internals.oldestWorkflowTimestamp).toBe(old.createdAt)
+  })
+})
+
+describe("poller-driven actions", () => {
+  test("r sends refresh to the poller", () => {
+    const { internals, handlers, client, loading } = makeApp([new FakeProvider("github")])
+    internals.setupEventHandlers()
+
+    handlers.refresh?.()
+
+    expect(client.refreshes).toEqual([undefined])
+    expect(loading.count).toBe(1)
+  })
+
+  test("after a cancel the run's repo is refreshed through the poller", async () => {
+    const run = makeRun({
+      provider: "github",
+      repo: { owner: "acme", name: "gears", fullName: "acme/gears" },
+    })
+    const github = new FakeProvider("github", [run])
+    const { internals, handlers, client } = makeApp([github])
+    internals.setupEventHandlers()
+
+    await handlers.kill?.(run)
+
+    expect(github.cancelled).toEqual([run.key])
+    expect(client.refreshes).toEqual([["acme/gears"]])
+  })
+
+  test("a failed cancel does not ask the poller for anything", async () => {
+    const run = makeRun({ provider: "github" })
+    const github = new FakeProvider("github", [run])
+    github.cancel = async () => {
+      throw new Error("nope")
+    }
+    const { internals, handlers, client } = makeApp([github])
+    internals.setupEventHandlers()
+
+    await handlers.kill?.(run)
+
+    expect(client.refreshes).toEqual([])
+  })
+
+  test("after a rerun the run's repo is refreshed through the poller", async () => {
+    const run = makeRun({ provider: "buildkite" })
+    const { internals, handlers, client } = makeApp([new FakeProvider("buildkite", [run])])
+    internals.setupEventHandlers()
+
+    await handlers.rerun?.(run)
+
+    expect(client.refreshes).toEqual([[run.repo.fullName]])
   })
 })
 
@@ -840,6 +1018,7 @@ describe("provider assembly", () => {
     const app = new App({
       dashboard,
       configManager,
+      pollerClient: new FakePollerClient(),
       buildkiteFactory: (options) => {
         captured.push(options)
         return { name: "buildkite" } as unknown as CiProvider
@@ -927,6 +1106,7 @@ describe("initialize() and injected providers", () => {
       providers: [provider],
       dashboard,
       configManager,
+      pollerClient: new FakePollerClient(),
       buildkiteFactory: () => {
         buildkiteFactoryCalls++
         return { name: "buildkite" } as unknown as CiProvider
@@ -973,10 +1153,12 @@ describe("--no-github disables GitHub CI runs only (Ruling 26)", () => {
       },
     } as unknown as GitHubProvider
 
+    const client = new FakePollerClient()
     const app = new App({
       github: fakeGithub,
       dashboard,
       configManager,
+      pollerClient: client,
       buildkiteFactory: stubBuildkite,
     })
 
@@ -989,7 +1171,11 @@ describe("--no-github disables GitHub CI runs only (Ruling 26)", () => {
 
     // GitHub is excluded from the CI provider list...
     expect(internals.providers.map((p) => p.name)).toEqual(["buildkite"])
-    // ...but repository resolution still went through the GitHub provider...
+    // ...the poller is told not to poll GitHub, but still gets the
+    // repositories (Buildkite derives its pipelines from them)...
+    expect(client.watches.at(-1)?.github).toBe(false)
+    expect(client.watches.at(-1)?.repositories).toEqual(["acme/widgets"])
+    // ...repository resolution still went through the GitHub provider...
     expect(listedOrgs).toEqual(["acme"])
     expect(internals.repositories).toEqual(["acme/widgets"])
     // ...and so did PR fetching (governed by --show-prs, not --no-github).
@@ -1012,20 +1198,23 @@ describe("initialize() explains its setup", () => {
   function makeInitApp(configManager: ConfigManager) {
     const { dashboard, rendered, logs } = makeDashboard()
     const fakeGithub = new FakeProvider("github") as unknown as GitHubProvider
+    const client = new FakePollerClient()
     const app = new App({
       github: fakeGithub,
       dashboard,
       configManager,
+      pollerClient: client,
       buildkiteFactory: stubBuildkite,
     })
-    return { app, rendered, logs }
+    return { app, rendered, logs, client }
   }
 
   // M2: an empty grid under --no-buildkite must say why there are no builds.
   test("--no-buildkite adds a single info diagnostic saying so", async () => {
-    const { app, rendered } = makeInitApp(new IsolatedConfigManager())
+    const { app, rendered, client } = makeInitApp(new IsolatedConfigManager())
 
     await app.initialize({ repositories: ["acme/widgets"], noBuildkite: true })
+    client.emitSnapshot(emptySnapshot())
 
     const diagnostics = rendered.at(-1)?.diagnostics ?? []
     expect(diagnostics).toEqual([
@@ -1035,10 +1224,12 @@ describe("initialize() explains its setup", () => {
   })
 
   test("without --no-buildkite there is no such diagnostic", async () => {
-    const { app, rendered } = makeInitApp(new IsolatedConfigManager())
+    const { app, rendered, client } = makeInitApp(new IsolatedConfigManager())
 
     await app.initialize({ repositories: ["acme/widgets"] })
+    client.emitSnapshot(emptySnapshot())
 
+    expect(rendered).toHaveLength(1)
     const messages = (rendered.at(-1)?.diagnostics ?? []).map((d) => d.message)
     expect(messages).not.toContain("Buildkite: disabled (--no-buildkite)")
     app.stop()
@@ -1064,5 +1255,158 @@ describe("initialize() explains its setup", () => {
 
     expect(logs).toContain("Config: no config file found, using defaults")
     app.stop()
+  })
+})
+
+describe("the shared poller", () => {
+  const originalToken = process.env.BUILDKITE_API_TOKEN
+  beforeEach(() => {
+    delete process.env.BUILDKITE_API_TOKEN
+  })
+  afterEach(() => {
+    if (originalToken === undefined) delete process.env.BUILDKITE_API_TOKEN
+    else process.env.BUILDKITE_API_TOKEN = originalToken
+  })
+
+  function makePollerApp(github?: Partial<GitHubProvider>) {
+    const view = makeDashboard()
+    const client = new FakePollerClient()
+    const app = new App({
+      github: { name: "github", ...github } as unknown as GitHubProvider,
+      dashboard: view.dashboard,
+      configManager: new IsolatedConfigManager(),
+      pollerClient: client,
+      buildkiteFactory: stubBuildkite,
+    })
+    return { app, client, internals: app as unknown as AppInternals, ...view }
+  }
+
+  test("the poller is told the repositories, interval and github flag", async () => {
+    const { app, client, rendered } = makePollerApp()
+
+    await app.initialize({ repositories: ["acme/widgets"], interval: 7 })
+
+    // Started first, then watched straight away.
+    expect(client.calls).toEqual(["start", "watch"])
+    expect(client.watches).toEqual([
+      { repositories: ["acme/widgets"], interval: 7000, github: true },
+    ])
+    // The pane fetches no runs itself: nothing renders until a snapshot.
+    expect(rendered).toEqual([])
+    app.stop()
+  })
+
+  test("the Buildkite subscription is what the Buildkite provider was built with", async () => {
+    process.env.BUILDKITE_API_TOKEN = "env-token"
+    const { app, client } = makePollerApp()
+
+    await app.initialize({ repositories: ["acme/widgets"], bkOrg: "acme", pipelines: ["deploy"] })
+
+    expect(client.watches.at(-1)?.buildkite).toEqual({
+      token: "env-token",
+      org: "acme",
+      pipelines: ["deploy"],
+    })
+    app.stop()
+  })
+
+  test("--no-buildkite leaves Buildkite out of the subscription even with a token", async () => {
+    process.env.BUILDKITE_API_TOKEN = "env-token"
+    const { app, client } = makePollerApp()
+
+    await app.initialize({ repositories: ["acme/widgets"], noBuildkite: true })
+
+    expect(client.watches.at(-1)?.buildkite).toBeUndefined()
+    app.stop()
+  })
+
+  test("--no-github sends github: false but still watches the repositories", async () => {
+    const { app, client } = makePollerApp()
+
+    await app.initialize({ repositories: ["acme/widgets"], noGithub: true })
+
+    expect(client.watches.at(-1)?.github).toBe(false)
+    expect(client.watches.at(-1)?.repositories).toEqual(["acme/widgets"])
+    app.stop()
+  })
+
+  test("a snapshot renders; an identical second snapshot still goes through tracking", async () => {
+    const { app, client, internals, rendered } = makePollerApp()
+    await app.initialize({ repositories: ["acme/widgets"] })
+    // Finished after ops-hud started, so it counts as having happened while watched.
+    const run = makeRun({ status: "failed", createdAt: new Date(Date.now() + 1000).toISOString() })
+    const snapshot: Snapshot = {
+      ...emptySnapshot(),
+      runs: [run],
+      jobs: { [run.key]: [makeJob(run.key, "failed")] },
+    }
+
+    client.emitSnapshot(snapshot)
+    expect(visibleKeys(rendered)).toEqual([run.key])
+    expect(rendered.at(-1)?.jobs.get(run.key)).toHaveLength(1)
+
+    // Dismissed, then the very same snapshot again: it is not skipped as a
+    // duplicate, and the dismissal applies to it.
+    internals.dismissRun(run.key)
+    const before = rendered.length
+    client.emitSnapshot(snapshot)
+
+    expect(rendered).toHaveLength(before + 1)
+    expect(visibleKeys(rendered)).toEqual([])
+    app.stop()
+  })
+
+  test("budget messages reach the dashboard", async () => {
+    const { app, client, budgets, statuses, logs } = makePollerApp()
+    await app.initialize({ repositories: ["acme/widgets"] })
+    const budget: Budget = {
+      provider: "github",
+      limit: 5000,
+      remaining: 4200,
+      resetAt: 1_800_000_000_000,
+      stretched: false,
+    }
+
+    client.emitBudget(budget)
+    client.emitStatus({ mode: "shared", pid: 42, message: "joined the shared poller" })
+
+    expect(budgets).toEqual([budget])
+    expect(statuses).toEqual([{ mode: "shared", pid: 42, message: "joined the shared poller" }])
+    expect(logs).toContain("joined the shared poller")
+    app.stop()
+  })
+
+  test("PRs are fetched on their own 30s timer, not per snapshot", async () => {
+    let prCalls = 0
+    const pr = { number: 1, title: "a PR", createdAt: "2026-09-17T10:00:00Z" }
+    const { app, client, rendered } = makePollerApp({
+      async getAllPullRequests() {
+        prCalls++
+        return [pr] as unknown as PullRequest[]
+      },
+    })
+    expect(PR_REFRESH_MS).toBe(30_000)
+
+    await app.initialize({ repositories: ["acme/widgets"], showPRs: true })
+    expect(prCalls).toBe(1) // once right away
+
+    client.emitSnapshot(emptySnapshot())
+    client.emitSnapshot(emptySnapshot())
+    expect(prCalls).toBe(1) // snapshots never fetch PRs
+
+    await app.pollPullRequests()
+    expect(prCalls).toBe(2)
+    // A PR poll re-renders the last grid with the fresh PRs.
+    expect(rendered.at(-1)?.prs).toEqual([pr])
+    app.stop()
+  })
+
+  test("stop closes the poller client", async () => {
+    const { app, client } = makePollerApp()
+    await app.initialize({ repositories: ["acme/widgets"] })
+
+    app.stop()
+
+    expect(client.closed).toBe(true)
   })
 })

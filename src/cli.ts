@@ -1,12 +1,7 @@
 import { Command } from "commander"
-import { readFileSync } from "fs"
-import { dirname, join } from "path"
-import { fileURLToPath } from "url"
 import { App } from "./app.js"
 import { resolveScope } from "./config.js"
-
-const __dirname = dirname(fileURLToPath(import.meta.url))
-const packageJson = JSON.parse(readFileSync(join(__dirname, "..", "package.json"), "utf-8"))
+import { readPackageVersion } from "./version.js"
 
 export interface WatchOptions {
   repo?: string[]
@@ -115,7 +110,7 @@ export function buildProgram(): Command {
   program
     .name("ops-hud")
     .description("CI and ops dashboard for the terminal — GitHub Actions and Buildkite")
-    .version(packageJson.version)
+    .version(readPackageVersion())
 
   addWatchOptions(program.command("watch").description("Watch CI runs")).action(watch)
 

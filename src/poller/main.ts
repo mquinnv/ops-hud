@@ -1,18 +1,15 @@
-import { appendFileSync, readFileSync, statSync, writeFileSync } from "node:fs"
+import { appendFileSync, statSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
-import { fileURLToPath } from "node:url"
 import { execa } from "execa"
 import { BuildkiteProvider } from "../providers/buildkite.js"
+import { readPackageVersion } from "../version.js"
 import { PollerCore } from "./core.js"
 import { GitHubPoller, resolveGitHubToken } from "./github-poller.js"
 import { socketPath } from "./protocol.js"
 import { PollerServer } from "./server.js"
 
 export const MAX_LOG_BYTES = 1024 * 1024
-
-const __dirname = dirname(fileURLToPath(import.meta.url))
-const packageJson = JSON.parse(readFileSync(join(__dirname, "..", "..", "package.json"), "utf-8"))
 
 /** One line per event, ISO timestamp first; the file is truncated once it passes MAX_LOG_BYTES. */
 function fileLogger(file: string): (line: string) => void {
@@ -37,9 +34,10 @@ function messageOf(error: unknown): string {
 
 /** The hidden `__poller` command: serves one PollerCore on this machine's socket until idle. */
 export async function runPoller(): Promise<void> {
+  const version = readPackageVersion()
   const path = socketPath({
     env: process.env,
-    version: packageJson.version,
+    version,
     entryScript: process.argv[1] ?? "",
     home: homedir(),
   })
@@ -54,7 +52,7 @@ export async function runPoller(): Promise<void> {
   })
   const server = new PollerServer(core, {
     socketPath: path,
-    version: packageJson.version,
+    version,
     log,
     onIdle: () => process.exit(0),
   })
@@ -74,5 +72,5 @@ export async function runPoller(): Promise<void> {
     process.stderr.write(`ops-hud poller: cannot listen on ${path}: ${messageOf(error)}\n`)
     process.exit(1)
   }
-  log(`poller ${packageJson.version} pid=${process.pid} started`)
+  log(`poller ${version} pid=${process.pid} started`)
 }
