@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, expect, test } from "bun:test"
-import { mkdtempSync, rmSync } from "node:fs"
-import { Socket } from "node:net"
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs"
+import { createServer, type Server, Socket } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { FetchResult } from "../providers/types.js"
+import type { Run } from "../types.js"
 import { RateBudget } from "./budget.js"
 import {
   InProcessPollerClient,
@@ -13,7 +14,7 @@ import {
 } from "./client.js"
 import { type GitHubSource, PollerCore } from "./core.js"
 import type { RepoState } from "./github-poller.js"
-import type { Budget, Snapshot, Subscription } from "./protocol.js"
+import { type Budget, encode, type Snapshot, type Subscription } from "./protocol.js"
 import { PollerServer } from "./server.js"
 
 const VERSION = "9.9.9"
@@ -78,6 +79,7 @@ let path: string
 let servers: PollerServer[]
 let cores: PollerCore[]
 let closers: (() => void)[]
+let raw: Server[]
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "ohc-"))
@@ -85,11 +87,13 @@ beforeEach(() => {
   servers = []
   cores = []
   closers = []
+  raw = []
 })
 
 afterEach(async () => {
   for (const close of closers) close()
   for (const s of servers) await s.close()
+  for (const r of raw) await new Promise((resolve) => r.close(resolve))
   for (const core of cores) core.stop()
   rmSync(dir, { recursive: true, force: true })
 })
@@ -321,4 +325,37 @@ test("InProcessPollerClient delivers snapshots from the core", async () => {
   client.close()
   expect(core.clientCount).toBe(0)
   expect(core.stops).toBeGreaterThan(0)
+})
+
+test("a snapshot line over 1 MiB is delivered intact", async () => {
+  const commitMessage = "x".repeat(2 * 1024 * 1024)
+  const run = { key: "github:acme/app:1", commitMessage } as Run
+  const snapshot: Snapshot = { repositories: [REPO], runs: [run], jobs: {}, diagnostics: [] }
+  mkdirSync(join(dir, "s"), { recursive: true })
+  const server = createServer((socket) => {
+    socket.on("error", () => {})
+    socket.write(encode({ type: "snapshot", snapshot }))
+  })
+  raw.push(server)
+  await new Promise<void>((resolve) => server.listen(path, resolve))
+  const h = harness()
+  await h.client.start()
+  await waitFor(() => h.snapshots.length > 0)
+  expect(h.snapshots[0].runs[0].commitMessage).toBe(commitMessage)
+  expect(h.statuses.at(-1)?.mode).toBe("shared")
+})
+
+test("a poller that hangs up on hello (version mismatch) leaves the client in-process", async () => {
+  const core = makeCore()
+  cores.push(core)
+  const server = new PollerServer(core, { socketPath: path, version: "0.0.1" })
+  servers.push(server)
+  await server.listen()
+  const h = harness({ rejoinMs: 10_000 })
+  h.client.watch(subscription())
+  await h.client.start()
+  await waitFor(() => h.statuses.at(-1)?.mode === "in-process")
+  expect(h.spawns).toBeLessThanOrEqual(1)
+  expect(h.fallbackCores).toHaveLength(1)
+  expect(core.clientCount).toBe(0)
 })

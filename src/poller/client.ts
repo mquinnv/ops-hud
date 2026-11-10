@@ -18,7 +18,6 @@ import {
   type Subscription,
   socketPath,
 } from "./protocol.js"
-import { MAX_LINE_BYTES } from "./server.js"
 
 export interface PollerStatus {
   mode: "shared" | "in-process"
@@ -42,6 +41,8 @@ export const STARTUP_TIMEOUT_MS = 3_000
 export const RETRY_MS = 100
 export const REJOIN_MS = 30_000
 export const STALE_SOCKET_MS = 5_000
+/** Larger than the server's 1 MiB: an org-wide snapshot can legitimately pass 1 MiB. */
+export const MAX_INBOUND_BYTES = 16 * 1024 * 1024
 
 const LOCAL_CLIENT_ID = "local"
 const DISCONNECTED: FetchResult = {
@@ -330,7 +331,7 @@ export class SocketPollerClient implements PollerClient {
         received = true
         if (isPollerMessage(message)) this.receive(message)
       }
-      if (buffer.length > MAX_LINE_BYTES) socket.destroy()
+      if (buffer.length > MAX_INBOUND_BYTES) socket.destroy()
     })
     socket.on("error", () => {})
     socket.on("close", () => this.dropped(socket, received))
