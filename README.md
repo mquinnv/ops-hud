@@ -234,6 +234,33 @@ organization.
 Finished runs stay until you dismiss them (`d`, or `D` for all). Anything
 older can be brought back with `U`.
 
+## How polling works
+
+Every ops-hud pane on a machine shares one background poller, so five tmux
+panes watching the same repository cost one set of GitHub requests, not five.
+The first pane starts the poller (a hidden `ops-hud __poller` process); the
+others find it over a Unix socket and subscribe. Panes only draw what the
+poller sends them.
+
+- **Socket**: `$OPS_HUD_POLLER_SOCKET` if set, else
+  `$XDG_CACHE_HOME/ops-hud/poller-<version>.sock`, else
+  `~/.cache/ops-hud/poller-<version>.sock`. Running from source adds a `-dev`
+  suffix, so a dev build never joins a released poller.
+- **Lifetime**: the poller exits 60 seconds after its last pane disconnects.
+- **Ticks**: while a pane is attached the poller polls every `refreshInterval`
+  (the *active* tick, never faster than 5s); the idle tick is fixed at 15s. If
+  your GitHub budget runs low (under 10% or 300 requests remaining) polling
+  slows to 4x those intervals, and on a rate limit it pauses until the limit
+  resets. Unchanged responses (304) don't count against the budget.
+- **Status bar**: the GitHub budget shows as `GH 4489/5000 · resets 14:32`,
+  `GH slow (budget low) …` or `GH paused until …`.
+- **Fallback**: if no poller can be reached within 3 seconds, the pane polls in
+  process, as ops-hud did before 2.1, and the status bar reads
+  `poller: in-process`. It retries joining a poller every 30 seconds.
+- **Pull requests** (`--show-prs`) refresh every 30 seconds in the pane itself.
+- **Log**: the poller writes `poller.log` next to its socket (truncated past
+  1 MiB).
+
 ## Configuration
 
 Create a `.ops-hud.json` file in your home directory or project root (see
@@ -272,7 +299,7 @@ key was never used and is now ignored.
 |--------|------|---------|-------------|
 | `repositories` | string[] | [] | Specific repositories to monitor |
 | `organizations` | string[] | [] | Organizations to monitor |
-| `refreshInterval` | number | 5000 | Refresh interval in milliseconds |
+| `refreshInterval` | number | 5000 | Active polling tick in milliseconds (minimum 5000); the idle tick is fixed at 15s |
 | `maxWorkflows` | number | 20 | Maximum number of runs to display |
 | `showCompletedFor` | number | 60 | Minutes of recent history shown on launch; `0` for none |
 | `buildkite.token` | string | — | Buildkite API token; `$BUILDKITE_API_TOKEN` takes precedence |
@@ -286,7 +313,7 @@ key was never used and is now ignored.
 | `-r, --repo <repositories...>` | Specific repositories to watch (`owner/repo`) |
 | `-c, --config <path>` | Path to configuration file |
 | `-o, --org <organizations...>` | Organizations to monitor |
-| `-i, --interval <seconds>` | Refresh interval in seconds (default: 5) |
+| `-i, --interval <seconds>` | Active polling tick in seconds (default: 5, minimum 5) |
 | `-p, --show-prs` | Show open pull requests in header |
 | `-d, --show-docker` | Show Docker Compose service status in header |
 | `--bk-org <org>` | Buildkite organization slug |
@@ -425,6 +452,14 @@ ops-hud/
 4. For Buildkite, check the empty-state panel and the status bar for a
    diagnostic explaining why — a missing/rejected token or an unmatched
    pipeline both show up there.
+
+### Status bar says `poller: in-process`
+
+The pane couldn't reach the shared poller within 3 seconds and is polling for
+itself (it retries every 30s). Check `poller.log` next to the socket (see
+[How polling works](#how-polling-works)), and that `OPS_HUD_POLLER_SOCKET`, if
+set, is the same in every pane and short enough for a socket path (about 100
+bytes on macOS). Panes with different values never share a poller.
 
 ### Performance issues
 

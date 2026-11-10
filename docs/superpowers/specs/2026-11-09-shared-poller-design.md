@@ -1,7 +1,7 @@
 # ops-hud: one poller per machine
 
 Date: 2026-11-09
-Status: approved in conversation; builder-check questions folded in
+Status: implemented 2026-11-10; see docs/superpowers/plans/2026-11-09-shared-poller.md
 
 ## Summary
 
