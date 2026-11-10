@@ -350,6 +350,14 @@ export class SocketPollerClient implements PollerClient {
     let buffer = ""
     socket.setEncoding("utf8")
     socket.on("data", (data: string) => {
+      // A chunk with no newline cannot complete a line: append it and skip the
+      // split, or a multi-megabyte snapshot arriving in 64 KiB chunks would
+      // rescan the whole buffer on every chunk.
+      if (!data.includes("\n")) {
+        buffer += data
+        if (buffer.length > MAX_INBOUND_BYTES) socket.destroy()
+        return
+      }
       const { messages, rest } = decodeLines(buffer + data)
       buffer = rest
       for (const message of messages) {

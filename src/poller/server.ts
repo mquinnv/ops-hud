@@ -211,6 +211,15 @@ export class PollerServer {
     socket.setEncoding("utf8")
     let buffer = ""
     socket.on("data", (data: string) => {
+      // No newline means no complete line yet: buffer it without rescanning.
+      if (!data.includes("\n")) {
+        buffer += data
+        if (buffer.length > MAX_LINE_BYTES) {
+          this.log(`${clientId} sent over 1 MiB without a newline; disconnecting`)
+          socket.destroy()
+        }
+        return
+      }
       const { messages, bad, rest } = decodeLines(buffer + data)
       buffer = rest
       // Never the whole line: a truncated watch line would put the Buildkite token in the log.
