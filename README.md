@@ -247,8 +247,10 @@ poller sends them.
   `~/.cache/ops-hud/poller-<version>.sock`. Running from source adds a `-dev`
   suffix, so a dev build never joins a released poller.
 - **Lifetime**: the poller exits 60 seconds after its last pane disconnects.
-- **Ticks**: while a pane is attached the poller polls every `refreshInterval`
-  (the *active* tick, never faster than 5s); the idle tick is fixed at 15s. If
+- **Ticks**: a repository with a run in flight is polled every
+  `refreshInterval` (the *active* tick: the fastest any watching pane asked
+  for, never faster than 5s); a repository with nothing in flight is polled
+  every 15s (the *idle* tick), however many panes watch it. If
   your GitHub budget runs low (under 10% or 300 requests remaining) polling
   slows to 4x those intervals, and on a rate limit it pauses until the limit
   resets. Unchanged responses (304) don't count against the budget.
@@ -256,10 +258,28 @@ poller sends them.
   `GH slow (budget low) …` or `GH paused until …`.
 - **Fallback**: if no poller can be reached within 3 seconds, the pane polls in
   process, as ops-hud did before 2.1, and the status bar reads
-  `poller: in-process`. It retries joining a poller every 30 seconds.
+  `poller: in-process`. Every 30 seconds it tries again to join a poller,
+  starting one if none is running, and keeps polling in process until one
+  answers. On Windows there is no shared poller: each pane always polls in
+  process.
 - **Pull requests** (`--show-prs`) refresh every 30 seconds in the pane itself.
-- **Log**: the poller writes `poller.log` next to its socket (truncated past
-  1 MiB).
+- **Log**: the poller writes `poller.log` next to its socket, one line per
+  event with an ISO timestamp first, truncated once it passes 1 MiB. It holds:
+  - lifecycle: `poller <version> pid=<pid> started`, `listening on <socket>`,
+    `removed stale socket file <socket>`, `no clients; exiting`, and the
+    socket file going missing or being replaced;
+  - panes: `c<n> connected`, `c<n> hello pid=<pid>`, `c<n> disconnected`,
+    refused panes (version mismatch, no hello) and socket errors;
+  - one pair per GitHub poll: `poll <owner/repo> <status> remaining=<n>`,
+    where status is the run list's HTTP status (`200`, `304`, `403`, …) or
+    `paused`, `unauthenticated` or `error:<reason>` when no response came
+    back, then `tick <owner/repo> next=<ms>`, the delay until that repository
+    is due again;
+  - `budget remaining=<n>/<limit> paused=<bool>` whenever the budget changes;
+  - `error: …` for errors the poller caught.
+
+  A malformed line from a pane is logged by its length and first 20
+  characters only, so a Buildkite token never lands in the log.
 
 ## Configuration
 
