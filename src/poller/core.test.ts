@@ -347,6 +347,54 @@ test("an in-flight poll of a repo is not started again by the next tick", async 
   expect(github.pollsOf("o/a")).toBe(2)
 })
 
+test("an unwatch and rewatch during a poll neither polls twice nor forgets the repo", async () => {
+  let release = () => {}
+  github.gate = new Promise((resolve) => {
+    release = resolve
+  })
+  github.active.add("o/a")
+  core.subscribe("c1", sub(["o/a"]))
+  const first = core.tick()
+  core.unsubscribe("c1")
+  expect(github.forgotten).toEqual(["o/a"])
+  core.subscribe("c2", sub(["o/a"]))
+  await core.tick()
+  expect(github.pollsOf("o/a")).toBe(1)
+  setState("o/a", [run("o/a", "1", "2024-01-01T00:00:00Z")])
+  release()
+  await first
+  github.gate = undefined
+  expect(github.forgotten).toEqual(["o/a"])
+  expect(ids(last("c2"))).toEqual(["1"])
+})
+
+test("a throwing snapshot listener does not reject tick() nor starve other listeners", async () => {
+  const errors: unknown[] = []
+  const quiet = new PollerCore({
+    github,
+    buildkiteFactory: (opts) => new FakeBuildkite(opts),
+    now,
+    onError: (error) => errors.push(error),
+  })
+  const received: Snapshot[] = []
+  quiet.onSnapshot(() => {
+    throw new Error("listener broke")
+  })
+  quiet.onSnapshot((_id, snapshot) => received.push(snapshot))
+  quiet.onBudget(() => {
+    throw new Error("budget listener broke")
+  })
+  github.active.add("o/a")
+  quiet.subscribe("c1", sub(["o/a"]))
+  expect(received).toHaveLength(1)
+  setState("o/a", [run("o/a", "1", "2024-01-01T00:00:00Z")])
+  github.budget.record(limitHeaders(4_000))
+  await expect(quiet.tick()).resolves.toBeUndefined()
+  expect(received).toHaveLength(2)
+  expect(ids(received[1])).toEqual(["1"])
+  expect(errors.length).toBeGreaterThanOrEqual(3)
+})
+
 test("a poll that throws becomes a diagnostic and does not reject tick()", async () => {
   github.active.add("o/a")
   github.failWith = new Error("boom")

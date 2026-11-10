@@ -25,6 +25,8 @@ export interface CoreDeps {
   github: GitHubSource
   buildkiteFactory: (opts: BuildkiteProviderOptions) => CiReader
   now?: () => number
+  /** Told about errors thrown by snapshot or budget listeners, which are otherwise swallowed. */
+  onError?: (error: unknown) => void
 }
 
 interface Client {
@@ -40,7 +42,6 @@ interface Schedule {
   /** budget.multiplier() as it was when the last poll finished. */
   multiplier: number
   lastRefreshAt?: number
-  inFlight: boolean
   /** A thrown poll, kept until the next poll succeeds. */
   error?: ProviderDiagnostic
 }
@@ -63,9 +64,14 @@ export class PollerCore {
   private readonly github: GitHubSource
   private readonly buildkiteFactory: CoreDeps["buildkiteFactory"]
   private readonly now: () => number
+  private readonly onError: (error: unknown) => void
   private readonly clients = new Map<string, Client>()
   private readonly repos = new Map<string, Schedule>()
   private readonly instances = new Map<string, Instance>()
+  // Keyed outside the replaceable Schedule/Instance, so an unwatch and rewatch
+  // during a poll cannot start a second one alongside it.
+  private readonly reposInFlight = new Set<string>()
+  private readonly instancesInFlight = new Set<string>()
   private readonly snapshotListeners: ((clientId: string, snapshot: Snapshot) => void)[] = []
   private readonly budgetListeners: ((budget: Budget) => void)[] = []
   private lastBudget?: string
@@ -75,6 +81,7 @@ export class PollerCore {
     this.github = deps.github
     this.buildkiteFactory = deps.buildkiteFactory
     this.now = deps.now ?? Date.now
+    this.onError = deps.onError ?? (() => {})
   }
 
   /** Replaces the client's subscription and sends it a snapshot of the current state at once. */
@@ -107,13 +114,13 @@ export class PollerCore {
     const polls: Promise<void>[] = []
     if (!this.github.budget.paused) {
       for (const [repo, schedule] of this.repos) {
-        if (!schedule.inFlight && now >= this.repoDueAt(repo, schedule)) {
-          polls.push(this.pollRepo(repo, schedule))
+        if (!this.reposInFlight.has(repo) && now >= this.repoDueAt(repo, schedule)) {
+          polls.push(this.pollRepo(repo))
         }
       }
     }
     for (const [key, instance] of this.instances) {
-      if (!instance.inFlight && now >= this.instanceDueAt(key, instance)) {
+      if (!this.instancesInFlight.has(key) && now >= this.instanceDueAt(key, instance)) {
         polls.push(this.pollInstance(key, instance))
       }
     }
@@ -128,22 +135,23 @@ export class PollerCore {
     if (!client) return
     const now = this.now()
     const fresh = (s: Schedule) =>
-      !s.inFlight && (s.lastRefreshAt === undefined || now - s.lastRefreshAt >= REFRESH_DEBOUNCE_MS)
+      s.lastRefreshAt === undefined || now - s.lastRefreshAt >= REFRESH_DEBOUNCE_MS
     const polls: Promise<void>[] = []
     if (!this.github.budget.paused) {
       for (const repo of repositories ?? client.subscription.repositories) {
         const schedule = this.repos.get(repo)
-        if (!schedule || !fresh(schedule)) continue
+        if (!schedule || this.reposInFlight.has(repo) || !fresh(schedule)) continue
         schedule.lastRefreshAt = now
-        polls.push(this.pollRepo(repo, schedule))
+        polls.push(this.pollRepo(repo))
       }
     }
     // The client's Buildkite instance too; BuildkiteProvider keeps its own 15s floor.
     const bk = client.subscription.buildkite
-    const instance = bk && this.instances.get(instanceKey(bk))
-    if (bk && instance && fresh(instance)) {
+    const key = bk && instanceKey(bk)
+    const instance = key && this.instances.get(key)
+    if (key && instance && !this.instancesInFlight.has(key) && fresh(instance)) {
       instance.lastRefreshAt = now
-      polls.push(this.pollInstance(instanceKey(bk), instance))
+      polls.push(this.pollInstance(key, instance))
     }
     await Promise.all(polls)
   }
@@ -163,7 +171,10 @@ export class PollerCore {
   }
 
   start(): void {
-    this.timer ??= setInterval(() => void this.tick(), TICK_MS)
+    // tick() never rejects; the catch is a backstop, since an unhandled rejection kills the process.
+    this.timer ??= setInterval(() => {
+      this.tick().catch((error: unknown) => this.onError(error))
+    }, TICK_MS)
   }
 
   stop(): void {
@@ -187,7 +198,7 @@ export class PollerCore {
       this.github.forget(repo)
     }
     for (const repo of githubRepos) {
-      if (!this.repos.has(repo)) this.repos.set(repo, { multiplier: 1, inFlight: false })
+      if (!this.repos.has(repo)) this.repos.set(repo, { multiplier: 1 })
     }
     for (const key of this.instances.keys()) {
       if (!instanceKeys.has(key)) this.instances.delete(key)
@@ -198,7 +209,6 @@ export class PollerCore {
       this.instances.set(key, {
         reader: this.buildkiteFactory(opts),
         multiplier: 1,
-        inFlight: false,
       })
     }
   }
@@ -244,26 +254,32 @@ export class PollerCore {
     return { repositories: [...repositories].sort(), pipelines: [...pipelines].sort() }
   }
 
-  private async pollRepo(repo: string, schedule: Schedule): Promise<void> {
-    schedule.inFlight = true
+  private async pollRepo(repo: string): Promise<void> {
+    this.reposInFlight.add(repo)
+    let error: ProviderDiagnostic | undefined
     try {
       await this.github.poll(repo)
-      schedule.error = undefined
-    } catch (error) {
-      const message = `GitHub: ${messageOf(error)}`
-      schedule.error = { provider: "github", level: "error", message, repository: repo }
+    } catch (thrown) {
+      const message = `GitHub: ${messageOf(thrown)}`
+      error = { provider: "github", level: "error", message, repository: repo }
     } finally {
-      schedule.inFlight = false
-      schedule.lastDoneAt = this.now()
-      schedule.multiplier = this.github.budget.multiplier()
+      this.reposInFlight.delete(repo)
     }
-    // Unsubscribed while in flight: the poll put the repo back, so drop it again.
-    if (this.repos.get(repo) !== schedule) this.github.forget(repo)
+    // Whatever schedule the repo has now, which may be a newer one than at the start.
+    const schedule = this.repos.get(repo)
+    if (!schedule) {
+      // Unwatched while in flight: the poll put the repo back, so drop it again.
+      this.github.forget(repo)
+      return
+    }
+    schedule.error = error
+    schedule.lastDoneAt = this.now()
+    schedule.multiplier = this.github.budget.multiplier()
     this.publishAll()
   }
 
   private async pollInstance(key: string, instance: Instance): Promise<void> {
-    instance.inFlight = true
+    this.instancesInFlight.add(key)
     try {
       instance.result = await instance.reader.fetchRuns(this.scopeOf(key))
       instance.error = undefined
@@ -274,9 +290,10 @@ export class PollerCore {
         message: `Buildkite: ${messageOf(error)}`,
       }
     } finally {
-      instance.inFlight = false
+      this.instancesInFlight.delete(key)
       instance.lastDoneAt = this.now()
     }
+    // A replaced instance's result is dropped; the new one is due at once.
     if (this.instances.get(key) === instance) this.publishAll()
   }
 
@@ -300,7 +317,7 @@ export class PollerCore {
       diagnostics,
       budget: this.github.budget.snapshot(),
     }
-    for (const listener of this.snapshotListeners) listener(clientId, snapshot)
+    for (const listener of this.snapshotListeners) this.notify(() => listener(clientId, snapshot))
   }
 
   private publishBudget(): void {
@@ -308,7 +325,16 @@ export class PollerCore {
     const serialized = JSON.stringify(budget)
     if (serialized === this.lastBudget) return
     this.lastBudget = serialized
-    for (const listener of this.budgetListeners) listener(budget)
+    for (const listener of this.budgetListeners) this.notify(() => listener(budget))
+  }
+
+  /** A throwing listener must not reject tick() nor starve the listeners after it. */
+  private notify(call: () => void): void {
+    try {
+      call()
+    } catch (error) {
+      this.onError(error)
+    }
   }
 
   private buildSnapshot(subscription: Subscription): Omit<Snapshot, "repositories" | "budget"> {
