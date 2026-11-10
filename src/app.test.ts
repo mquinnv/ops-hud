@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 import { mkdtempSync, writeFileSync } from "fs"
 import { tmpdir } from "os"
 import { join } from "path"
-import { App, PR_REFRESH_MS } from "./app.js"
+import { App, PR_REFRESH_MS, REFRESH_SPINNER_MS } from "./app.js"
 import { ConfigManager } from "./config.js"
 import type { Dashboard } from "./dashboard.js"
 import type { PollerClient, PollerStatus } from "./poller/client.js"
@@ -199,14 +199,18 @@ function makeDashboard() {
   const handlers: CapturedHandlers = {}
   const budgets: Array<Budget | undefined> = []
   const statuses: PollerStatus[] = []
-  const loading = { count: 0 }
+  const loading = { count: 0, stopped: 0 }
+  // Knobs for the tests: a modal over the grid, a render that throws once.
+  const controls = { modalOpen: false, throwOnNextRender: false }
 
   const dashboard = {
-    isModalOpen: () => false,
+    isModalOpen: () => controls.modalOpen,
     showLoadingInStatus() {
       loading.count++
     },
-    stopRefreshAnimation() {},
+    stopRefreshAnimation() {
+      loading.stopped++
+    },
     setBudget(budget: Budget | undefined) {
       budgets.push(budget)
     },
@@ -224,6 +228,10 @@ function makeDashboard() {
       _docker?: unknown,
       diagnostics?: ProviderDiagnostic[],
     ) {
+      if (controls.throwOnNextRender) {
+        controls.throwOnNextRender = false
+        throw new Error("render failed")
+      }
       rendered.push({ runs, jobs, diagnostics, prs })
     },
     getCurrentWorkflows(): Run[] {
@@ -266,6 +274,7 @@ function makeDashboard() {
     budgets,
     statuses,
     loading,
+    controls,
   }
 }
 
@@ -290,18 +299,25 @@ interface AppInternals {
 // each test states the visibility window it depends on.
 function makeApp(
   providers: Array<CiProvider & CiReader>,
-  opts: { now?: () => number; historyMinutes?: number } = {},
+  opts: { now?: () => number; historyMinutes?: number; refreshSpinnerMs?: number } = {},
 ) {
-  const { dashboard, rendered, logs, handlers, loading } = makeDashboard()
+  const { dashboard, rendered, logs, handlers, loading, controls } = makeDashboard()
   const configManager = new ConfigManager()
   configManager.updateFromArgs({ showCompletedFor: opts.historyMinutes ?? 0 })
   const client = new FakePollerClient()
-  const app = new App({ providers, dashboard, configManager, now: opts.now, pollerClient: client })
+  const app = new App({
+    providers,
+    dashboard,
+    configManager,
+    now: opts.now,
+    pollerClient: client,
+    refreshSpinnerMs: opts.refreshSpinnerMs,
+  })
   const internals = app as unknown as AppInternals
   internals.repositories = ["acme/widgets"]
   /** One poll: what the poller would send for these providers, applied. */
   const refresh = async () => app.applySnapshot(await snapshotFrom(providers, ["acme/widgets"]))
-  return { app, internals, rendered, logs, handlers, client, refresh, loading }
+  return { app, internals, rendered, logs, handlers, client, refresh, loading, controls }
 }
 
 /** A raw Buildkite build payload, for tests that drive the real provider. */
@@ -942,6 +958,34 @@ describe("resurrect", () => {
   })
 })
 
+describe("applySnapshot robustness", () => {
+  // The poller sends a snapshot only when the view changed, so one skipped
+  // under a modal would never come again.
+  test("a snapshot under an open modal is still tracked and handed to the dashboard", async () => {
+    const run = makeRun({ status: "running" })
+    const { internals, rendered, refresh, controls } = makeApp([new FakeProvider("github", [run])])
+    controls.modalOpen = true
+
+    await refresh()
+
+    expect(internals.watchedWorkflows.has(run.key)).toBe(true)
+    expect(visibleKeys(rendered)).toEqual([run.key])
+  })
+
+  test("an error while applying a snapshot is logged and the next one still renders", async () => {
+    const run = makeRun({ status: "running" })
+    const { rendered, logs, refresh, controls } = makeApp([new FakeProvider("github", [run])])
+    controls.throwOnNextRender = true
+
+    await refresh()
+    expect(logs).toContain("Error applying snapshot: Error: render failed")
+    expect(rendered).toEqual([])
+
+    await refresh()
+    expect(visibleKeys(rendered)).toEqual([run.key])
+  })
+})
+
 describe("poller-driven actions", () => {
   test("r sends refresh to the poller", () => {
     const { internals, handlers, client, loading } = makeApp([new FakeProvider("github")])
@@ -951,6 +995,54 @@ describe("poller-driven actions", () => {
 
     expect(client.refreshes).toEqual([undefined])
     expect(loading.count).toBe(1)
+  })
+
+  test("REFRESH_SPINNER_MS is two seconds", () => {
+    expect(REFRESH_SPINNER_MS).toBe(2_000)
+  })
+
+  // Nothing changed, so the poller sends no snapshot: the pane stops the spinner.
+  test("r with no snapshot arriving stops the spinner after the timer", async () => {
+    const { app, internals, handlers, loading } = makeApp([new FakeProvider("github")], {
+      refreshSpinnerMs: 5,
+    })
+    internals.setupEventHandlers()
+
+    handlers.refresh?.()
+    expect(loading.stopped).toBe(0)
+    await Bun.sleep(30)
+
+    expect(loading.stopped).toBe(1)
+    app.stop()
+  })
+
+  test("a snapshot arriving after r clears the spinner timer", async () => {
+    const { app, internals, handlers, loading, refresh } = makeApp(
+      [new FakeProvider("github", [makeRun()])],
+      { refreshSpinnerMs: 5 },
+    )
+    internals.setupEventHandlers()
+
+    handlers.refresh?.()
+    await refresh()
+    await Bun.sleep(30)
+
+    // updateWorkflows stops it in the real dashboard; the timer never fires.
+    expect(loading.stopped).toBe(0)
+    app.stop()
+  })
+
+  test("stop clears a pending spinner timer", async () => {
+    const { app, internals, handlers, loading } = makeApp([new FakeProvider("github")], {
+      refreshSpinnerMs: 5,
+    })
+    internals.setupEventHandlers()
+
+    handlers.refresh?.()
+    app.stop()
+    await Bun.sleep(30)
+
+    expect(loading.stopped).toBe(0)
   })
 
   test("after a cancel the run's repo is refreshed through the poller", async () => {

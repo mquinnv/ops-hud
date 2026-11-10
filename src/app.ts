@@ -28,6 +28,12 @@ const CLOCK_SKEW_GRACE_MS = 30_000
 /** Pull requests are polled by the pane on their own timer, apart from CI runs. */
 export const PR_REFRESH_MS = 30_000
 
+/**
+ * After `r`, the pane stops the status-bar spinner itself after this long: the
+ * poller sends no snapshot when nothing changed, and only a snapshot stops it.
+ */
+export const REFRESH_SPINNER_MS = 2_000
+
 /** Substitutions for the tests; production constructs every one of these. */
 export interface AppDependencies {
   github?: GitHubProvider
@@ -47,6 +53,8 @@ export interface AppDependencies {
    * which joins or spawns the shared poller process.
    */
   pollerClient?: PollerClient
+  /** How long `r`'s spinner may run with no snapshot; REFRESH_SPINNER_MS by default. */
+  refreshSpinnerMs?: number
 }
 
 export class App {
@@ -77,6 +85,9 @@ export class App {
   // PR and Docker polls only re-render once a snapshot has drawn the grid;
   // before that they just store their data for the first snapshot to show.
   private hasSnapshot = false
+  // Stops the spinner `r` starts when no snapshot arrives to stop it.
+  private refreshSpinnerTimer?: NodeJS.Timeout
+  private readonly refreshSpinnerMs: number
   private repositories: string[] = []
   private jobs: Map<string, Job[]> = new Map() // Keyed by Run.key
   private watchedWorkflows: Set<string> = new Set() // Run keys we've been watching
@@ -122,6 +133,12 @@ export class App {
     this.watchingSince = (deps.now ?? Date.now)()
     // Never constructed here: the production client is built in initialize().
     this.pollerClient = deps.pollerClient
+    this.refreshSpinnerMs = deps.refreshSpinnerMs ?? REFRESH_SPINNER_MS
+  }
+
+  private clearRefreshSpinnerTimer(): void {
+    clearTimeout(this.refreshSpinnerTimer)
+    this.refreshSpinnerTimer = undefined
   }
 
   async initialize(args: {
@@ -261,6 +278,14 @@ export class App {
     this.dashboard.onRefresh(() => {
       this.dashboard.showLoadingInStatus()
       this.pollerClient?.refresh()
+      // Only a snapshot stops the spinner, and the poller sends none when
+      // nothing changed: stop it ourselves after a moment.
+      this.clearRefreshSpinnerTimer()
+      this.refreshSpinnerTimer = setTimeout(() => {
+        this.refreshSpinnerTimer = undefined
+        this.dashboard.stopRefreshAnimation()
+      }, this.refreshSpinnerMs)
+      this.refreshSpinnerTimer.unref()
       if (this.showPRs) void this.pollPullRequests()
       if (this.showDocker) void this.pollDocker()
     })
@@ -573,12 +598,23 @@ export class App {
   /**
    * One poll's worth of runs from the poller: tracks what was watched,
    * finished and dismissed, then renders. Every snapshot goes through this,
-   * even one identical to the last.
+   * even one identical to the last, and even under an open modal: the poller
+   * sends a snapshot only when the view changed, so one skipped here would
+   * never come again. The dashboard stores the data and draws it once the
+   * modal closes.
    */
   applySnapshot(snapshot: Snapshot): void {
-    // Don't re-render under an open modal; the next snapshot catches up.
-    if (this.dashboard.isModalOpen()) return
+    // updateWorkflows stops the refresh spinner itself.
+    this.clearRefreshSpinnerTimer()
+    try {
+      this.trackAndRender(snapshot)
+    } catch (error) {
+      // The client's listener wrapper would swallow this silently.
+      this.dashboard.log(`Error applying snapshot: ${error}`, "error")
+    }
+  }
 
+  private trackAndRender(snapshot: Snapshot): void {
     const snapshotJobs = new Map<string, Job[]>(Object.entries(snapshot.jobs))
     const diagnostics = [...snapshot.diagnostics]
     if (this.buildkiteDisabled) {
@@ -851,6 +887,7 @@ export class App {
     clearInterval(this.dockerTimer)
     this.prTimer = undefined
     this.dockerTimer = undefined
+    this.clearRefreshSpinnerTimer()
     this.pollerClient?.close()
     this.dashboard.destroy()
   }
